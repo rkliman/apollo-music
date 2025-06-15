@@ -191,8 +191,9 @@ fn find_duplicates(db_path: &str) {
 }
 
 fn load_settings() -> Settings {
+    let config_path = shellexpand::tilde("~/.config/apollo-music/config.toml").to_string();
     app_config::Config::builder()
-        .add_source(app_config::File::with_name("Settings.toml"))
+        .add_source(app_config::File::with_name(&config_path))
         .add_source(app_config::Environment::with_prefix("APP"))
         .build()
         .unwrap()
