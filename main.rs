@@ -7,6 +7,7 @@ use shellexpand;
 use walkdir; // Add walkdir import
 use std::fs;
 use strsim;
+use colored::*;
 
 
 /// Search for a pattern in a file and display the lines that contain it.
@@ -338,6 +339,53 @@ fn index_playlists(music_dir: &str, db_path: &str) {
     tx.commit().expect("Failed to commit transaction");
 }
 
+fn list_tracks(db_path: &str) {
+    let db_path = shellexpand::tilde(db_path).to_string();
+    let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
+
+    let mut stmt = conn.prepare("SELECT artist, album, title FROM tracks").expect("Failed to prepare statement");
+    let mut rows = stmt.query([]).expect("Failed to execute query");
+
+    while let Some(row) = rows.next().expect("Failed to fetch row") {
+        let artist: String = row.get(0).unwrap_or_default();
+        let album: String = row.get(1).unwrap_or_default();
+        let title: String = row.get(2).unwrap_or_default();
+        println!(
+            "Track: {}, Artist: {}, Album: {}",
+            title.cyan(),
+            artist.cyan(),
+            album.cyan()
+        );
+    }
+}
+
+fn export_tracks(db_path: &str) {
+    let db_path = shellexpand::tilde(db_path).to_string();
+    let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
+
+    let mut stmt = conn.prepare("SELECT artist, album, title FROM tracks").expect("Failed to prepare statement");
+    let mut rows = stmt.query([]).expect("Failed to execute query");
+
+    // Write CSV to a file in the same directory as the database, named "tracks_export.csv"
+    let db_folder = std::path::Path::new(&db_path).parent().unwrap_or_else(|| std::path::Path::new("."));
+    let csv_path = db_folder.join("tracks_export.csv");
+    let file = std::fs::File::create(&csv_path).expect("Failed to create CSV file");
+    let mut wtr = csv::Writer::from_writer(file);
+
+    // Write CSV header
+    wtr.write_record(&["Artist", "Album", "Title"]).expect("Failed to write CSV header");
+
+    while let Some(row) = rows.next().expect("Failed to fetch row") {
+        let artist: String = row.get(0).unwrap_or_default();
+        let album: String = row.get(1).unwrap_or_default();
+        let title: String = row.get(2).unwrap_or_default();
+        wtr.write_record(&[artist, album, title]).expect("Failed to write CSV record");
+    }
+
+    wtr.flush().expect("Failed to flush CSV writer");
+    println!("Exported tracks to {}", csv_path.display());
+}
+
 fn main() {
     let settings = load_settings();
 
@@ -363,18 +411,10 @@ fn main() {
             find_duplicates(&db_path);
         }
         "ls" => {
-            let db_path = shellexpand::tilde(&db_path).to_string();
-            let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
-
-            let mut stmt = conn.prepare("SELECT artist, album, title FROM tracks").expect("Failed to prepare statement");
-            let mut rows = stmt.query([]).expect("Failed to execute query");
-
-            while let Some(row) = rows.next().expect("Failed to fetch row") {
-                let artist: String = row.get(0).unwrap_or_default();
-                let album: String = row.get(1).unwrap_or_default();
-                let title: String = row.get(2).unwrap_or_default();
-                println!("Track: {}, Artist: {}, Album: {}", title, artist, album);
-            }
+            list_tracks(&db_path);
+        }
+        "export" => {
+            export_tracks(&db_path);
         }
         _ => {
             eprintln!("Unknown command: {}", args.command);
