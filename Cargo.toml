@@ -11,6 +11,7 @@ edition = "2024"
 clap = { version = "4.2.7", features = ["derive"] }
 config = {version = "0.15.11", features = ["yaml"]}
 "serde" = { version = "1.0.188", features = ["derive"] }
+"strsim" = "0.10.0"
 
 [[bin]]
 name = "apollo-music"

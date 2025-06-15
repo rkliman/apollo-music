@@ -6,6 +6,7 @@ use serde::Deserialize;
 use shellexpand;
 use walkdir; // Add walkdir import
 use std::fs;
+use strsim;
 
 
 /// Search for a pattern in a file and display the lines that contain it.
@@ -202,8 +203,8 @@ fn load_settings() -> Settings {
 fn index_playlists(music_dir: &str, db_path: &str) {
     // loads and indexes .m3u or .m3u8 playlists in the given directory and stores them in a database
     // create or open the database
-    let db_path = shellexpand::tilde(db_path).to_string();
-    let mut conn = rusqlite::Connection::open(db_path).expect("Failed to open database");
+    let db_path = shellexpand::tilde(&db_path).to_string();
+    let mut conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
     conn.execute(
         "CREATE TABLE IF NOT EXISTS playlists (
             id INTEGER PRIMARY KEY,
@@ -270,6 +271,34 @@ fn index_playlists(music_dir: &str, db_path: &str) {
                                 name,
                                 song_path.display()
                             );
+
+                            // Suggest similar files in the music directory
+                            let song_file_name = song_path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+                            if !song_file_name.is_empty() {
+                                let db_path = shellexpand::tilde(&db_path).to_string();
+                                let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
+                                let mut stmt = conn.prepare("SELECT path FROM tracks").expect("Failed to prepare statement");
+                                let mut suggestions = Vec::new();
+                                let mut rows = stmt.query([]).expect("Failed to execute query");
+                                while let Some(row) = rows.next().expect("Failed to fetch row") {
+                                    let candidate_path: String = row.get(0).expect("Failed to get path");
+                                    let candidate_file_name = std::path::Path::new(&candidate_path)
+                                        .file_name()
+                                        .and_then(|f| f.to_str())
+                                        .unwrap_or("");
+                                    let score = strsim::jaro(candidate_file_name, song_file_name);
+                                    suggestions.push((score, candidate_path));
+                                }
+                                // Sort by descending similarity score and take top 5
+                                suggestions.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                                let top_suggestions: Vec<_> = suggestions.into_iter().take(5).collect();
+                                if !top_suggestions.is_empty() {
+                                    println!("  Top suggestions for '{}':", song_file_name);
+                                    for (score, suggestion) in top_suggestions {
+                                        println!("    {} (score: {:.3})", suggestion, score);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
