@@ -1,5 +1,4 @@
 use config as app_config;
-use inquire::length;
 use lofty::file::TaggedFileExt;
 use lofty::prelude::ItemKey;
 use clap::{Parser, Subcommand, ArgAction};
@@ -361,6 +360,7 @@ fn index_playlists(music_dir: &str, db_path: &str) {
                                         .iter()
                                         .map(|(_, suggestion)| suggestion.clone())
                                         .collect();
+                                    options.push("Remove".to_string());
                                     options.push("Skip".to_string());
 
                                     // Use inquire to let user select a replacement or skip
@@ -368,7 +368,7 @@ fn index_playlists(music_dir: &str, db_path: &str) {
                                         &format!("Select a replacement for '{}':", song_file_name),
                                         options.clone(),
                                     ).prompt() {
-                                        Ok(selected) if selected != "Skip" => {
+                                        Ok(selected) if selected != "Skip" && selected != "Remove" => {
                                             // Replace the missing song in the playlist file
                                             println!("  Replacing '{}' with '{}'", song_path.display(), selected);
                                             let new_content: String = content.lines()
@@ -384,6 +384,17 @@ fn index_playlists(music_dir: &str, db_path: &str) {
                                             if let Err(e) = std::fs::write(path, new_content) {
                                                 eprintln!("Failed to update playlist file: {}", e);
                                             }   
+                                        }
+                                        Ok(selected) if selected == "Remove" => {
+                                            // Remove the missing song from the playlist file
+                                            println!("  Removing '{}' from playlist", song_path.display());
+                                            let new_content: String = content.lines()
+                                                .filter(|line| line.trim() != trimmed)
+                                                .collect::<Vec<_>>()
+                                                .join("\n");
+                                            if let Err(e) = std::fs::write(path, new_content) {
+                                                eprintln!("Failed to update playlist file: {}", e);
+                                            }
                                         }
                                         Ok(_) | Err(_) => {
                                             println!("  Skipped replacement for '{}'", song_path.display());
