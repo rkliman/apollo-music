@@ -136,7 +136,9 @@ fn find_duplicates(db_path: &str, fix: bool) {
 
     let mut rows = stmt.query([]).expect("Failed to execute query");
 
+    let mut found_duplicates = false;
     while let Some(row) = rows.next().expect("Failed to fetch row") {
+        found_duplicates = true;
         let artist: String = row.get(0).expect("Failed to get artist");
         let title: String = row.get(1).expect("Failed to get title");
         let count: i32 = row.get(2).expect("Failed to get count");
@@ -161,29 +163,33 @@ fn find_duplicates(db_path: &str, fix: bool) {
             let mut options: Vec<String> = vec!["Skip".to_string()];
             options.extend(paths.iter().map(|(_, p)| p.clone()));
             match inquire::Select::new(
-            &format!("Which file do you want to keep for '{} - {}'?", artist, title),
-            options.clone(),
+                &format!("Which file do you want to keep for '{} - {}'?", artist, title),
+                options.clone(),
             ).prompt() {
-            Ok(selected) if selected != "Skip" => {
-                // Remove all except the selected one
-                for (id, path) in &paths {
-                if path != &selected {
-                    // Delete from database
-                    conn.execute("DELETE FROM tracks WHERE id = ?1", [id]).expect("Failed to delete duplicate");
-                    println!("  Removed duplicate from database: {}", path);
-                    // Delete from filesystem
-                    match std::fs::remove_file(path) {
-                    Ok(_) => println!("  Deleted file from filesystem: {}", path),
-                    Err(e) => eprintln!("  Failed to delete file '{}': {}", path, e),
+                Ok(selected) if selected != "Skip" => {
+                    // Remove all except the selected one
+                    for (id, path) in &paths {
+                        if path != &selected {
+                            // Delete from database
+                            conn.execute("DELETE FROM tracks WHERE id = ?1", [id]).expect("Failed to delete duplicate");
+                            println!("  Removed duplicate from database: {}", path);
+                            // Delete from filesystem
+                            match std::fs::remove_file(path) {
+                                Ok(_) => println!("  Deleted file from filesystem: {}", path),
+                                Err(e) => eprintln!("  Failed to delete file '{}': {}", path, e),
+                            }
+                        }
                     }
                 }
+                Ok(_) | Err(_) => {
+                    println!("  Skipped fixing '{} - {}'", artist, title);
                 }
             }
-            Ok(_) | Err(_) => {
-                println!("  Skipped fixing '{} - {}'", artist, title);
-            }
-            }
         }
+    }
+
+    if !found_duplicates {
+        println!("{}", "No duplicate tracks found.".green());
     }
 
     // Identify tracks where a lower quality version exists (FLAC > M4A > MP3)
@@ -197,6 +203,7 @@ fn find_duplicates(db_path: &str, fix: bool) {
 
     let mut rows = stmt.query([]).expect("Failed to execute quality check query");
 
+    let mut found_quality_dupes = false;
     while let Some(row) = rows.next().expect("Failed to fetch row") {
         let artist: String = row.get(0).expect("Failed to get artist");
         let title: String = row.get(1).expect("Failed to get title");
@@ -226,6 +233,7 @@ fn find_duplicates(db_path: &str, fix: bool) {
 
         // If there are at least two files and the best quality is not the only one
         if qualities.len() > 1 && qualities[0].0 < qualities[1].0 {
+            found_quality_dupes = true;
             println!("{}", format!("{} - {}", artist, title).cyan());
             for (rank, path) in &qualities {
                 let label = match rank {
@@ -237,6 +245,10 @@ fn find_duplicates(db_path: &str, fix: bool) {
                 println!("  [{}] {}", label, path);
             }
         }
+    }
+
+    if !found_quality_dupes {
+        println!("{}", "No lower quality duplicates found.".green());
     }
 }
 
