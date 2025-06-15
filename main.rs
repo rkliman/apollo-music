@@ -1,6 +1,5 @@
 use config as app_config;
 use lofty::file::TaggedFileExt;
-use lofty::id3::v2::PrivateFrame;
 use lofty::prelude::ItemKey;
 use clap::Parser;
 use serde::Deserialize;
@@ -64,6 +63,7 @@ fn index_library(music_dir: &str, db_path: &str) {
         tx.execute("DELETE FROM tracks WHERE path = ?1", [&path]).ok();
     }
 
+    println!("Indexing music files in directory: {}", music_dir);
     for entry in walkdir::WalkDir::new(&music_dir)
         .into_iter()
         .filter_map(Result::ok)
@@ -86,7 +86,7 @@ fn index_library(music_dir: &str, db_path: &str) {
         if let Some(ext) = path.extension() {
             if ext == "mp3" || ext == "flac" || ext == "wav" {
                 let path_str = path.to_string_lossy();
-                tx.execute(
+                let result = tx.execute(
                     "INSERT OR IGNORE INTO tracks (path, artist, album, title) VALUES (?1, ?2, ?3, ?4)",
                     [
                         &path_str as &dyn rusqlite::ToSql,
@@ -94,7 +94,10 @@ fn index_library(music_dir: &str, db_path: &str) {
                         &album,
                         &title,
                     ]
-                ).ok();
+                );
+                if let Ok(1) = result {
+                    println!("Added to database: {}", path_str);
+                }
             }
         }
     }
@@ -184,8 +187,6 @@ fn find_duplicates(db_path: &str) {
             }
         }
     }
-
-
 }
 
 fn load_settings() -> Settings {
@@ -196,6 +197,86 @@ fn load_settings() -> Settings {
         .unwrap()
         .try_deserialize()
         .unwrap()
+}
+
+fn index_playlists(music_dir: &str, db_path: &str) {
+    // loads and indexes .m3u or .m3u8 playlists in the given directory and stores them in a database
+    // create or open the database
+    let db_path = shellexpand::tilde(db_path).to_string();
+    let mut conn = rusqlite::Connection::open(db_path).expect("Failed to open database");
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS playlists (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            path TEXT NOT NULL UNIQUE
+        )",
+        [],
+    ).expect("Failed to create playlists table");
+
+    let tx = conn.transaction().expect("Failed to start transaction");
+
+    // Remove playlists from the database that no longer exist on the filesystem
+    let mut stmt = tx.prepare("SELECT path FROM playlists").expect("Failed to prepare select statement");
+    let mut rows = stmt.query([]).expect("Failed to query playlists");
+
+    let mut to_remove = Vec::new();
+    while let Some(row) = rows.next().expect("Failed to fetch row") {
+        let path: String = row.get(0).expect("Failed to get path");
+        if !std::path::Path::new(&path).exists() {
+            to_remove.push(path);
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    for path in to_remove {
+        println!("Removing missing playlist from database: {}", path);
+        tx.execute("DELETE FROM playlists WHERE path = ?1", [&path]).ok();
+    }
+
+    println!("Indexing playlists in directory: {}", music_dir);
+    for entry in walkdir::WalkDir::new(&music_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+    {
+        let path = entry.path();
+        if let Some(ext) = path.extension() {
+            if ext == "m3u" || ext == "m3u8" {
+                let path_str = path.to_string_lossy();
+                let name = path.file_stem().unwrap_or_default().to_string_lossy();
+                tx.execute(
+                    "INSERT OR IGNORE INTO playlists (name, path) VALUES (?1, ?2)",
+                    [&name as &dyn rusqlite::ToSql, &path_str]
+                ).ok();
+
+                // Check for missing files in the playlist
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    let playlist_dir = path.parent().unwrap_or_else(|| std::path::Path::new(""));
+                    for line in content.lines() {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() || trimmed.starts_with('#') {
+                            continue;
+                        }
+                        // Handle relative and absolute paths
+                        let song_path = if std::path::Path::new(trimmed).is_absolute() {
+                            std::path::PathBuf::from(trimmed)
+                        } else {
+                            playlist_dir.join(trimmed)
+                        };
+                        if !song_path.exists() {
+                            println!(
+                                "Missing file in playlist '{}': {}",
+                                name,
+                                song_path.display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    tx.commit().expect("Failed to commit transaction");
 }
 
 fn main() {
@@ -217,6 +298,7 @@ fn main() {
     match args.command.as_str() {
         "index" => {
             index_library(&music_dir, &db_path);
+            index_playlists(&music_dir, &db_path);
         }
         "find-duplicates" => {
             find_duplicates(&db_path);
