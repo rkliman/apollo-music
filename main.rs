@@ -308,7 +308,19 @@ fn index_playlists(music_dir: &str, db_path: &str) {
                                         Ok(selected) if selected != "Skip" => {
                                             // Replace the missing song in the playlist file
                                             println!("  Replacing '{}' with '{}'", song_path.display(), selected);
-                                            
+                                            let new_content: String = content.lines()
+                                                .map(|line| {
+                                                    if line.trim() == trimmed {
+                                                        selected.clone()
+                                                    } else {
+                                                        line.to_string()
+                                                    }
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join("\n");
+                                            if let Err(e) = std::fs::write(path, new_content) {
+                                                eprintln!("Failed to update playlist file: {}", e);
+                                            }   
                                         }
                                         Ok(_) | Err(_) => {
                                             println!("  Skipped replacement for '{}'", song_path.display());
