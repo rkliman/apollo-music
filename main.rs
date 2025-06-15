@@ -123,7 +123,7 @@ fn find_duplicates(db_path: &str) {
         let artist: String = row.get(0).expect("Failed to get artist");
         let title: String = row.get(1).expect("Failed to get title");
         let count: i32 = row.get(2).expect("Failed to get count");
-        println!("Duplicate track: {} - {} ({} times)", artist, title, count);
+        println!("{} {}", format!("{} - {}", artist, title).cyan(), format!(" ({} times)", count).yellow());
 
         // Query for file paths of this duplicate track
         let mut path_stmt = conn.prepare(
@@ -133,7 +133,7 @@ fn find_duplicates(db_path: &str) {
         let mut path_rows = path_stmt.query([&artist, &title]).expect("Failed to execute path query");
         while let Some(path_row) = path_rows.next().expect("Failed to fetch path row") {
             let path: String = path_row.get(0).expect("Failed to get path");
-            println!("  Path: {}", path);
+            println!("  {}", path);
         }
     }
 
@@ -177,7 +177,7 @@ fn find_duplicates(db_path: &str) {
 
         // If there are at least two files and the best quality is not the only one
         if qualities.len() > 1 && qualities[0].0 < qualities[1].0 {
-            println!("{} - {}", artist, title);
+            println!("{}", format!("{} - {}", artist, title).cyan());
             for (rank, path) in &qualities {
                 let label = match rank {
                     1 => "FLAC",
