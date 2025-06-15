@@ -1,7 +1,8 @@
 use config as app_config;
+use inquire::length;
 use lofty::file::TaggedFileExt;
 use lofty::prelude::ItemKey;
-use clap::Parser;
+use clap::{Parser, Subcommand, ArgAction};
 use serde::Deserialize;
 use shellexpand;
 use walkdir; // Add walkdir import
@@ -13,8 +14,24 @@ use colored::*;
 /// Search for a pattern in a file and display the lines that contain it.
 #[derive(Parser)]
 struct Cli {
-    /// The pattern to look for
-    command: String,
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Index the music library and playlists
+    Index,
+    /// Find duplicate tracks
+    Dupes {
+        /// Interactively fix duplicates
+        #[arg(long, action = ArgAction::SetTrue)]
+        fix: bool,
+    },
+    /// List all tracks
+    Ls,
+    /// Export tracks to CSV
+    Export,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,7 +124,7 @@ fn index_library(music_dir: &str, db_path: &str) {
     tx.commit().expect("Failed to commit transaction");
 }
 
-fn find_duplicates(db_path: &str) {
+fn find_duplicates(db_path: &str, fix: bool) {
     let db_path = shellexpand::tilde(db_path).to_string();
     let conn = rusqlite::Connection::open(db_path).expect("Failed to open database");
 
@@ -127,13 +144,45 @@ fn find_duplicates(db_path: &str) {
 
         // Query for file paths of this duplicate track
         let mut path_stmt = conn.prepare(
-            "SELECT path FROM tracks WHERE artist = ?1 AND title = ?2"
+            "SELECT id, path FROM tracks WHERE artist = ?1 AND title = ?2"
         ).expect("Failed to prepare path statement");
 
         let mut path_rows = path_stmt.query([&artist, &title]).expect("Failed to execute path query");
+        let mut paths = Vec::new();
         while let Some(path_row) = path_rows.next().expect("Failed to fetch path row") {
-            let path: String = path_row.get(0).expect("Failed to get path");
+            let id: i64 = path_row.get(0).expect("Failed to get id");
+            let path: String = path_row.get(1).expect("Failed to get path");
             println!("  {}", path);
+            paths.push((id, path));
+        }
+
+        if fix && paths.len() > 1 {
+            // Make "Skip" the first option
+            let mut options: Vec<String> = vec!["Skip".to_string()];
+            options.extend(paths.iter().map(|(_, p)| p.clone()));
+            match inquire::Select::new(
+            &format!("Which file do you want to keep for '{} - {}'?", artist, title),
+            options.clone(),
+            ).prompt() {
+            Ok(selected) if selected != "Skip" => {
+                // Remove all except the selected one
+                for (id, path) in &paths {
+                if path != &selected {
+                    // Delete from database
+                    conn.execute("DELETE FROM tracks WHERE id = ?1", [id]).expect("Failed to delete duplicate");
+                    println!("  Removed duplicate from database: {}", path);
+                    // Delete from filesystem
+                    match std::fs::remove_file(path) {
+                    Ok(_) => println!("  Deleted file from filesystem: {}", path),
+                    Err(e) => eprintln!("  Failed to delete file '{}': {}", path, e),
+                    }
+                }
+                }
+            }
+            Ok(_) | Err(_) => {
+                println!("  Skipped fixing '{} - {}'", artist, title);
+            }
+            }
         }
     }
 
@@ -389,35 +438,28 @@ fn export_tracks(db_path: &str) {
 fn main() {
     let settings = load_settings();
 
-    // Optionally expand tildes
     let music_dir = shellexpand::tilde(&settings.files.music_directory).to_string();
     let db_path = shellexpand::tilde(&settings.files.database_name).to_string();
 
-    // Ensure the database exists, if not create it
     let db_folder = std::path::Path::new(&db_path).parent().unwrap();
     if !std::path::Path::new(&db_folder).exists() {
         fs::create_dir_all(&db_folder).expect("Failed to create music directory");
     }
 
-
-    // Parse command line arguments
     let args = Cli::parse();
-    match args.command.as_str() {
-        "index" => {
+    match args.command {
+        Commands::Index => {
             index_library(&music_dir, &db_path);
             index_playlists(&music_dir, &db_path);
         }
-        "find-duplicates" => {
-            find_duplicates(&db_path);
+        Commands::Dupes { fix } => {
+            find_duplicates(&db_path, fix);
         }
-        "ls" => {
+        Commands::Ls => {
             list_tracks(&db_path);
         }
-        "export" => {
+        Commands::Export => {
             export_tracks(&db_path);
-        }
-        _ => {
-            eprintln!("Unknown command: {}", args.command);
         }
     }
 }
