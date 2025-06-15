@@ -294,8 +294,25 @@ fn index_playlists(music_dir: &str, db_path: &str) {
                                 let top_suggestions: Vec<_> = suggestions.into_iter().take(5).collect();
                                 if !top_suggestions.is_empty() {
                                     println!("  Top suggestions for '{}':", song_file_name);
-                                    for (score, suggestion) in top_suggestions {
-                                        println!("    {} (score: {:.3})", suggestion, score);
+                                    let mut options: Vec<String> = top_suggestions
+                                        .iter()
+                                        .map(|(_, suggestion)| suggestion.clone())
+                                        .collect();
+                                    options.push("Skip".to_string());
+
+                                    // Use inquire to let user select a replacement or skip
+                                    match inquire::Select::new(
+                                        &format!("Select a replacement for '{}':", song_file_name),
+                                        options.clone(),
+                                    ).prompt() {
+                                        Ok(selected) if selected != "Skip" => {
+                                            // Replace the missing song in the playlist file
+                                            println!("  Replacing '{}' with '{}'", song_path.display(), selected);
+                                            
+                                        }
+                                        Ok(_) | Err(_) => {
+                                            println!("  Skipped replacement for '{}'", song_path.display());
+                                        }
                                     }
                                 }
                             }
