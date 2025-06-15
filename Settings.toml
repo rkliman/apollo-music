@@ -1,0 +1,3 @@
+[files]
+music_directory = "~/Music"
+database_name = "~/.config/apollo-music/music_library.db"

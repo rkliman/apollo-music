@@ -1,0 +1,242 @@
+use config as app_config;
+use lofty::file::TaggedFileExt;
+use lofty::id3::v2::PrivateFrame;
+use lofty::prelude::ItemKey;
+use clap::Parser;
+use serde::Deserialize;
+use shellexpand;
+use walkdir; // Add walkdir import
+use std::fs;
+
+
+/// Search for a pattern in a file and display the lines that contain it.
+#[derive(Parser)]
+struct Cli {
+    /// The pattern to look for
+    command: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FilesConfig {
+    music_directory: String,
+    database_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Settings {
+    files: FilesConfig,
+}
+
+fn index_library(music_dir: &str, db_path: &str) {
+    // create or open the database
+
+    let db_path = shellexpand::tilde(db_path).to_string();
+    let mut conn = rusqlite::Connection::open(db_path).expect("Failed to open database");
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS tracks (
+            id INTEGER PRIMARY KEY,
+            path TEXT NOT NULL UNIQUE,
+            artist TEXT,
+            album TEXT,
+            title TEXT
+        )",
+        [],
+    ).expect("Failed to create table");
+
+    let tx = conn.transaction().expect("Failed to start transaction");
+
+    let mut stmt = tx.prepare("SELECT path FROM tracks").expect("Failed to prepare select statement");
+    let mut rows = stmt.query([]).expect("Failed to query tracks");
+
+    let mut to_remove = Vec::new();
+    while let Some(row) = rows.next().expect("Failed to fetch row") {
+        let path: String = row.get(0).expect("Failed to get path");
+        if !std::path::Path::new(&path).exists() {
+            to_remove.push(path);
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    for path in to_remove {
+        println!("Removing missing file from database: {}", path);
+        tx.execute("DELETE FROM tracks WHERE path = ?1", [&path]).ok();
+    }
+
+    for entry in walkdir::WalkDir::new(&music_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+    {
+        let path = entry.path();
+        // println!("Indexing file: {:?}", path);
+        let (artist, album, title) = match lofty::read_from_path(path) {
+            Ok(tagged_file) => {
+                let tag = tagged_file.primary_tag();
+                let artist = tag.and_then(|t| t.get_string(&ItemKey::TrackArtist)).unwrap_or("").to_string();
+                let album = tag.and_then(|t| t.get_string(&ItemKey::AlbumTitle)).unwrap_or("").to_string();
+                let title = tag.and_then(|t| t.get_string(&ItemKey::TrackTitle)).unwrap_or("").to_string();
+                (artist, album, title)
+            }
+            Err(_) => ("".to_string(), "".to_string(), "".to_string()),
+        };
+        // println!("Artist: {}, Album: {}, Title: {}", artist, album, title);
+
+        if let Some(ext) = path.extension() {
+            if ext == "mp3" || ext == "flac" || ext == "wav" {
+                let path_str = path.to_string_lossy();
+                tx.execute(
+                    "INSERT OR IGNORE INTO tracks (path, artist, album, title) VALUES (?1, ?2, ?3, ?4)",
+                    [
+                        &path_str as &dyn rusqlite::ToSql,
+                        &artist,
+                        &album,
+                        &title,
+                    ]
+                ).ok();
+            }
+        }
+    }
+
+    tx.commit().expect("Failed to commit transaction");
+}
+
+fn find_duplicates(db_path: &str) {
+    let db_path = shellexpand::tilde(db_path).to_string();
+    let conn = rusqlite::Connection::open(db_path).expect("Failed to open database");
+
+    let mut stmt = conn.prepare(
+        "SELECT artist, title, COUNT(*) as count FROM tracks \
+         WHERE artist != '' AND title != '' \
+         GROUP BY artist, title HAVING count > 1",
+    ).expect("Failed to prepare statement");
+
+    let mut rows = stmt.query([]).expect("Failed to execute query");
+
+    while let Some(row) = rows.next().expect("Failed to fetch row") {
+        let artist: String = row.get(0).expect("Failed to get artist");
+        let title: String = row.get(1).expect("Failed to get title");
+        let count: i32 = row.get(2).expect("Failed to get count");
+        println!("Duplicate track: {} - {} ({} times)", artist, title, count);
+
+        // Query for file paths of this duplicate track
+        let mut path_stmt = conn.prepare(
+            "SELECT path FROM tracks WHERE artist = ?1 AND title = ?2"
+        ).expect("Failed to prepare path statement");
+
+        let mut path_rows = path_stmt.query([&artist, &title]).expect("Failed to execute path query");
+        while let Some(path_row) = path_rows.next().expect("Failed to fetch path row") {
+            let path: String = path_row.get(0).expect("Failed to get path");
+            println!("  Path: {}", path);
+        }
+    }
+
+    // Identify tracks where a lower quality version exists (FLAC > M4A > MP3)
+    println!("\nTracks with lower quality duplicates (FLAC > M4A > MP3):");
+
+    let mut stmt = conn.prepare(
+        "SELECT artist, title, GROUP_CONCAT(path) as paths FROM tracks \
+         WHERE artist != '' AND title != '' \
+         GROUP BY artist, title HAVING COUNT(*) > 1"
+    ).expect("Failed to prepare statement for quality check");
+
+    let mut rows = stmt.query([]).expect("Failed to execute quality check query");
+
+    while let Some(row) = rows.next().expect("Failed to fetch row") {
+        let artist: String = row.get(0).expect("Failed to get artist");
+        let title: String = row.get(1).expect("Failed to get title");
+        let paths: String = row.get(2).expect("Failed to get paths");
+        let files: Vec<&str> = paths.split(',').collect();
+
+        // Map extensions to quality rank (lower is better)
+        fn quality_rank(ext: &str) -> u8 {
+            match ext.to_lowercase().as_str() {
+                "flac" => 1,
+                "m4a" => 2,
+                "mp3" => 3,
+                _ => 100,
+            }
+        }
+
+        let mut qualities: Vec<(u8, &str)> = files.iter()
+            .filter_map(|p| {
+                std::path::Path::new(p)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|ext| (quality_rank(ext), *p))
+            })
+            .collect();
+
+        qualities.sort_by_key(|q| q.0);
+
+        // If there are at least two files and the best quality is not the only one
+        if qualities.len() > 1 && qualities[0].0 < qualities[1].0 {
+            println!("{} - {}", artist, title);
+            for (rank, path) in &qualities {
+                let label = match rank {
+                    1 => "FLAC",
+                    2 => "M4A",
+                    3 => "MP3",
+                    _ => "OTHER",
+                };
+                println!("  [{}] {}", label, path);
+            }
+        }
+    }
+
+
+}
+
+fn load_settings() -> Settings {
+    app_config::Config::builder()
+        .add_source(app_config::File::with_name("Settings.toml"))
+        .add_source(app_config::Environment::with_prefix("APP"))
+        .build()
+        .unwrap()
+        .try_deserialize()
+        .unwrap()
+}
+
+fn main() {
+    let settings = load_settings();
+
+    // Optionally expand tildes
+    let music_dir = shellexpand::tilde(&settings.files.music_directory).to_string();
+    let db_path = shellexpand::tilde(&settings.files.database_name).to_string();
+
+    // Ensure the database exists, if not create it
+    let db_folder = std::path::Path::new(&db_path).parent().unwrap();
+    if !std::path::Path::new(&db_folder).exists() {
+        fs::create_dir_all(&db_folder).expect("Failed to create music directory");
+    }
+
+
+    // Parse command line arguments
+    let args = Cli::parse();
+    match args.command.as_str() {
+        "index" => {
+            index_library(&music_dir, &db_path);
+        }
+        "find-duplicates" => {
+            find_duplicates(&db_path);
+        }
+        "ls" => {
+            let db_path = shellexpand::tilde(&db_path).to_string();
+            let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
+
+            let mut stmt = conn.prepare("SELECT artist, album, title FROM tracks").expect("Failed to prepare statement");
+            let mut rows = stmt.query([]).expect("Failed to execute query");
+
+            while let Some(row) = rows.next().expect("Failed to fetch row") {
+                let artist: String = row.get(0).unwrap_or_default();
+                let album: String = row.get(1).unwrap_or_default();
+                let title: String = row.get(2).unwrap_or_default();
+                println!("Track: {}, Artist: {}, Album: {}", title, artist, album);
+            }
+        }
+        _ => {
+            eprintln!("Unknown command: {}", args.command);
+        }
+    }
+}

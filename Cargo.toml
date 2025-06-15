@@ -1,0 +1,17 @@
+[package]
+name = "apollo-music"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+"rusqlite" = "0.36.0"
+"walkdir" = "2.3.2"
+"shellexpand" = "3.1.1"
+"lofty" = "0.22.4"
+clap = { version = "4.2.7", features = ["derive"] }
+config = {version = "0.15.11", features = ["yaml"]}
+"serde" = { version = "1.0.188", features = ["derive"] }
+
+[[bin]]
+name = "apollo-music"
+path = "main.rs"
