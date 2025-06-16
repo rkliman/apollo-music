@@ -8,6 +8,12 @@ use walkdir; // Add walkdir import
 use std::fs;
 use strsim;
 use colored::*;
+use fs_extra::dir::get_size;
+use human_bytes::human_bytes;
+use symphonia::core::probe::Hint;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::default::{get_probe};
+use std::fs::File;
 
 
 /// Search for a pattern in a file and display the lines that contain it.
@@ -31,6 +37,8 @@ enum Commands {
     Ls,
     /// Export tracks to CSV
     Export,
+    /// Show statistics
+    Stats,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,7 +64,8 @@ fn index_library(music_dir: &str, db_path: &str) {
             path TEXT NOT NULL UNIQUE,
             artist TEXT,
             album TEXT,
-            title TEXT
+            title TEXT,
+            duration INTEGER
         )",
         [],
     ).expect("Failed to create table");
@@ -88,7 +97,6 @@ fn index_library(music_dir: &str, db_path: &str) {
         .filter(|e| e.file_type().is_file())
     {
         let path = entry.path();
-        // println!("Indexing file: {:?}", path);
         let (artist, album, title) = match lofty::read_from_path(path) {
             Ok(tagged_file) => {
                 let tag = tagged_file.primary_tag();
@@ -99,22 +107,24 @@ fn index_library(music_dir: &str, db_path: &str) {
             }
             Err(_) => ("".to_string(), "".to_string(), "".to_string()),
         };
-        // println!("Artist: {}, Album: {}, Title: {}", artist, album, title);
+
+        let duration = get_duration_with_symphonia(path);
 
         if let Some(ext) = path.extension() {
             if ext == "mp3" || ext == "flac" || ext == "wav" {
                 let path_str = path.to_string_lossy();
                 let result = tx.execute(
-                    "INSERT OR IGNORE INTO tracks (path, artist, album, title) VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT OR IGNORE INTO tracks (path, artist, album, title, duration) VALUES (?1, ?2, ?3, ?4, ?5)",
                     [
                         &path_str as &dyn rusqlite::ToSql,
                         &artist,
                         &album,
                         &title,
+                        &duration,
                     ]
                 );
                 if let Ok(1) = result {
-                    println!("Added to database: {}", path_str);
+                    println!("Added to database: {} (duration: {}s)", path_str, duration);
                 }
             }
         }
@@ -458,6 +468,76 @@ fn export_tracks(db_path: &str) {
     println!("Exported tracks to {}", csv_path.display());
 }
 
+fn get_stats(music_dir: &str, db_path: &str) {
+    let db_path = shellexpand::tilde(db_path).to_string();
+    let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
+
+    let total_tracks: i64 = conn.query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get(0)).unwrap_or(0);
+    let total_artists: i64 = conn.query_row("SELECT COUNT(DISTINCT artist) FROM tracks", [], |row| row.get(0)).unwrap_or(0);
+    let total_albums: i64 = conn.query_row("SELECT COUNT(DISTINCT album) FROM tracks", [], |row| row.get(0)).unwrap_or(0);
+    let total_duration: f64 = conn.query_row(
+        "SELECT SUM(duration) FROM tracks",
+        [],
+        |row| row.get(0)
+    ).unwrap_or(0.0);
+
+    fn format_duration(secs: f64) -> String {
+        let months: f64 = secs / 2592000.0;
+        let weeks: f64 = secs / 604800.0;
+        let days: f64 = secs / 86400.0;
+        let hours: f64 = secs / 3600.0;
+        let minutes: f64 = secs / 60.0;
+        if months > 1.0 {
+            format!("{:.2} months", months)
+        } else if weeks > 1.0 {
+            format!("{:.2} weeks", weeks)
+        } else if days > 1.0 {
+            format!("{:.2} days", days)
+        } else if hours > 1.0 {
+            format!("{:.2} hours", hours)
+        } else if minutes > 1.0 {
+            format!("{:.2} minutes", minutes)
+        } else {
+            format!("{:.2} seconds", secs)
+        }
+    }
+
+    let folder_size: String = human_bytes(get_size(&music_dir).unwrap() as f64);
+
+
+
+    println!("Total tracks: {}", total_tracks);
+    println!("Total artists: {}", total_artists);
+    println!("Total albums: {}", total_albums);
+    println!("Total size: {}", folder_size);
+    println!("Total time: {}", format_duration(total_duration));
+}
+
+fn get_duration_with_symphonia(path: &std::path::Path) -> i64 {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let hint = Hint::new();
+    let probed = match get_probe().format(&hint, mss, &Default::default(), &Default::default()) {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    let format = probed.format;
+    let track = match format.default_track() {
+        Some(t) => t,
+        None => return 0,
+    };
+    let tb = track.codec_params.time_base;
+    let dur = track.codec_params.n_frames;
+    if let (Some(tb), Some(dur)) = (tb, dur) {
+        tb.calc_time(dur).seconds as i64
+    } else {
+        0
+    }
+}
+
 fn main() {
     let settings = load_settings();
 
@@ -483,6 +563,9 @@ fn main() {
         }
         Commands::Export => {
             export_tracks(&db_path);
+        }
+        Commands::Stats => {
+            get_stats(&music_dir, &db_path);
         }
     }
 }
