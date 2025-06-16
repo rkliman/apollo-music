@@ -118,7 +118,7 @@ fn index_library(music_dir: &str, db_path: &str) {
             Err(_) => ("".to_string(), "".to_string(), "".to_string()),
         };
 
-        let duration = get_duration_with_symphonia(path);
+        // let duration = get_duration_with_symphonia(path);
 
         if let Some(ext) = path.extension() {
             if ext == "mp3" || ext == "flac" || ext == "wav" {
@@ -130,7 +130,7 @@ fn index_library(music_dir: &str, db_path: &str) {
                         &artist,
                         &album,
                         &title,
-                        &duration,
+                        &0.0 as &dyn rusqlite::ToSql, // Placeholder for duration
                     ]
                 );
                 if let Ok(1) = result {
@@ -487,6 +487,19 @@ fn get_stats(music_dir: &str, db_path: &str) {
     let total_tracks: i64 = conn.query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get(0)).unwrap_or(0);
     let total_artists: i64 = conn.query_row("SELECT COUNT(DISTINCT artist) FROM tracks", [], |row| row.get(0)).unwrap_or(0);
     let total_albums: i64 = conn.query_row("SELECT COUNT(DISTINCT album) FROM tracks", [], |row| row.get(0)).unwrap_or(0);
+    
+    // update durations if they are zero
+    let mut stmt = conn.prepare("SELECT id, path, duration FROM tracks WHERE duration = 0").expect("Failed to prepare statement");
+    let mut rows = stmt.query([]).expect("Failed to execute query");
+    while let Some(row) = rows.next().expect("Failed to fetch row") {
+        let id: i64 = row.get(0).expect("Failed to get id");
+        let path: String = row.get(1).expect("Failed to get path");
+        let duration: f64 = get_duration_with_symphonia(std::path::Path::new(&path)) as f64;
+        if duration > 0.0 {
+            conn.execute("UPDATE tracks SET duration = ?1 WHERE id = ?2", [duration, id as f64]).expect("Failed to update duration");
+        }
+    }
+    
     let total_duration: f64 = conn.query_row(
         "SELECT SUM(duration) FROM tracks",
         [],
