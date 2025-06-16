@@ -14,6 +14,7 @@ use symphonia::core::probe::Hint;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::default::{get_probe};
 use std::fs::File;
+use indicatif::{ProgressBar, ProgressStyle};
 
 
 /// Search for a pattern in a file and display the lines that contain it.
@@ -91,11 +92,20 @@ fn index_library(music_dir: &str, db_path: &str) {
     }
 
     println!("Indexing music files in directory: {}", music_dir);
-    for entry in walkdir::WalkDir::new(&music_dir)
+
+    // Collect all files first to know the total count
+    let entries: Vec<_> = walkdir::WalkDir::new(&music_dir)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
-    {
+        .collect();
+
+    let pb = ProgressBar::new(entries.len() as u64);
+    pb.set_style(ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+        .unwrap()
+        .progress_chars("##-"));
+
+    for entry in entries {
         let path = entry.path();
         let (artist, album, title) = match lofty::read_from_path(path) {
             Ok(tagged_file) => {
@@ -124,11 +134,13 @@ fn index_library(music_dir: &str, db_path: &str) {
                     ]
                 );
                 if let Ok(1) = result {
-                    println!("Added to database: {} (duration: {}s)", path_str, duration);
+                    pb.set_message(format!("Added: {}", path_str));
                 }
             }
         }
+        pb.inc(1);
     }
+    pb.finish_with_message("Indexing complete");
 
     tx.commit().expect("Failed to commit transaction");
 }
