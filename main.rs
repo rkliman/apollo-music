@@ -440,15 +440,16 @@ fn list_tracks(db_path: &str) {
     let mut stmt = conn.prepare("SELECT artist, album, title FROM tracks").expect("Failed to prepare statement");
     let mut rows = stmt.query([]).expect("Failed to execute query");
 
+    println!("Track - Artist - Album");
     while let Some(row) = rows.next().expect("Failed to fetch row") {
         let artist: String = row.get(0).unwrap_or_default();
         let album: String = row.get(1).unwrap_or_default();
         let title: String = row.get(2).unwrap_or_default();
         println!(
-            "Track: {}, Artist: {}, Album: {}",
-            title.cyan(),
-            artist.cyan(),
-            album.cyan()
+            "{} - {} - {}",
+            title,
+            artist,
+            album
         );
     }
 }
