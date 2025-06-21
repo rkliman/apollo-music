@@ -19,6 +19,7 @@ fs_extra = "1.2.0"
 human_bytes = "0.4.3"
 symphonia = { version = "0.5", features = ["mp3", "flac", "wav"] }
 indicatif = "0.17.11"
+globset = "0.4"
 
 [[bin]]
 name = "apollo"

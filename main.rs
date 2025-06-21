@@ -17,6 +17,7 @@ use symphonia::default::{get_probe};
 use std::fs::File;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap; // Add this line
+use globset::{Glob, GlobSetBuilder}; // Add this import
 
 
 /// Search for a pattern in a file and display the lines that contain it.
@@ -52,7 +53,8 @@ enum Commands {
 struct FilesConfig {
     music_directory: String,
     database_name: String,
-    file_pattern: Option<String>, // Add this line
+    file_pattern: Option<String>,
+    ignore: Option<Vec<String>>, // <-- Add this line
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,6 +87,28 @@ fn index_library(settings: &Settings, dry_run: bool) {
     let music_dir = shellexpand::tilde(&settings.files.music_directory).to_string();
     let db_path = shellexpand::tilde(&settings.files.database_name).to_string();
     let file_pattern = settings.files.file_pattern.as_deref();
+
+    // Build ignore matcher
+    let mut glob_builder = GlobSetBuilder::new();
+    if let Some(ignore_patterns) = &settings.files.ignore {
+        for pattern in ignore_patterns {
+            if let Ok(glob) = Glob::new(pattern) {
+                glob_builder.add(glob);
+            }
+        }
+    }
+    let glob_set = glob_builder.build().unwrap();
+
+    let entries: Vec<_> = walkdir::WalkDir::new(&music_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| {
+            // Get the path relative to music_dir for matching
+            let rel_path = e.path().strip_prefix(&music_dir).unwrap_or(e.path());
+            !glob_set.is_match(rel_path)
+        })
+        .collect();
 
     // create or open the database
     let mut conn = rusqlite::Connection::open(db_path).expect("Failed to open database");
@@ -125,12 +149,6 @@ fn index_library(settings: &Settings, dry_run: bool) {
     println!("Indexing music files in directory: {}", music_dir);
 
     // Collect all files first to know the total count
-    let entries: Vec<_> = walkdir::WalkDir::new(&music_dir)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
-        .collect();
-
     let pb = ProgressBar::new(entries.len() as u64);
     pb.set_style(ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
         .unwrap()
