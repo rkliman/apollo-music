@@ -377,7 +377,6 @@ fn index_playlists(music_dir: &str, db_path: &str) {
                                 suggestions.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
                                 let top_suggestions: Vec<_> = suggestions.into_iter().take(5).collect();
                                 if !top_suggestions.is_empty() {
-                                    println!("  Top suggestions for '{}':", song_file_name);
                                     let mut options: Vec<String> = top_suggestions
                                         .iter()
                                         .map(|(score, suggestion)| format!("({:.3}) {} ", score, suggestion))
@@ -389,19 +388,7 @@ fn index_playlists(music_dir: &str, db_path: &str) {
                                     let (top_score, top_path) = &top_suggestions[0];
                                     if *top_score >= 0.9 {
                                         println!("  Auto-replacing '{}' with '{}' (similarity {:.3})", song_path.display(), top_path, top_score);
-                                        let new_content: String = content.lines()
-                                            .map(|line| {
-                                                if line.trim() == trimmed {
-                                                    top_path.clone()
-                                                } else {
-                                                    line.to_string()
-                                                }
-                                            })
-                                            .collect::<Vec<_>>()
-                                            .join("\n");
-                                        if let Err(e) = std::fs::write(path, new_content) {
-                                            eprintln!("Failed to update playlist file: {}", e);
-                                        }
+                                        update_playlist_line(&path_str, &song_path.display().to_string(), top_path).expect("Failed to update playlist");
                                     } else {
                                         // Use inquire to let user select a replacement or skip
                                         match inquire::Select::new(
@@ -417,28 +404,13 @@ fn index_playlists(music_dir: &str, db_path: &str) {
                                                     .map(|s| s.trim())
                                                     .unwrap_or(&selected);
                                                 println!("  Replacing '{}' with '{}'", song_path.display(), selected_path);
-                                                let new_content: String = content.lines()
-                                                    .map(|line| {
-                                                        if line.trim() == trimmed {
-                                                            selected_path.to_string()
-                                                        } else {
-                                                            line.to_string()
-                                                        }
-                                                    })
-                                                    .collect::<Vec<_>>()
-                                                    .join("\n");
-                                                if let Err(e) = std::fs::write(path, new_content) {
-                                                    eprintln!("Failed to update playlist file: {}", e);
-                                                }   
+                                                update_playlist_line(&path_str, &song_path.display().to_string(), selected_path).expect("Failed to update playlist");
                                             }
                                             Ok(selected) if selected == "Remove" => {
                                                 // Remove the missing song from the playlist file
                                                 println!("  Removing '{}' from playlist", song_path.display());
-                                                let new_content: String = content.lines()
-                                                    .filter(|line| line.trim() != trimmed)
-                                                    .collect::<Vec<_>>()
-                                                    .join("\n");
-                                                if let Err(e) = std::fs::write(path, new_content) {
+                                                // Use update_playlist_line with new_line as empty string to indicate removal
+                                                if let Err(e) = update_playlist_line(&path_str, &song_path.display().to_string(), "") {
                                                     eprintln!("Failed to update playlist file: {}", e);
                                                 }
                                             }
@@ -597,8 +569,6 @@ fn extract_song_name_from_filename(filename: &str) -> Option<String> {
     // Split on " - " and take the second part as song name
     let parts1: Vec<&str> = file_stem.split(" - ").collect();
     let parts2: Vec<&str> = file_stem.split(" － ").collect();
-    println!("Parts: {:?}", parts1);
-    println!("Parts: {:?}", parts2);
     if parts1.len() > 1 {
         return Some(parts1[1].to_string());
     }
@@ -609,6 +579,42 @@ fn extract_song_name_from_filename(filename: &str) -> Option<String> {
     else {
         return None;
     }
+}
+
+fn update_playlist_line(playlist_path: &str, target_line: &str, new_line: &str) -> std::io::Result<()> {
+    use std::path::{Path, PathBuf};
+
+    let content = std::fs::read_to_string(playlist_path)?;
+    let playlist_dir = Path::new(playlist_path).parent().unwrap_or_else(|| Path::new(""));
+
+    // Convert target_line and new_line to relative paths (if possible)
+    let target_path = Path::new(target_line);
+    let target_rel = target_path.strip_prefix(playlist_dir).unwrap_or(target_path);
+
+    let new_path = Path::new(new_line);
+    let new_rel = new_path.strip_prefix(playlist_dir).unwrap_or(new_path);
+
+    let mut replaced = false;
+    let mut new_lines = Vec::new();
+    for line in content.lines() {
+        let line_path = Path::new(line.trim());
+        let line_rel = line_path.strip_prefix(playlist_dir).unwrap_or(line_path);
+
+        if !replaced && line_rel == target_rel {
+            new_lines.push(new_rel.to_string_lossy().to_string());
+            replaced = true;
+        } else {
+            new_lines.push(line.to_string());
+        }
+    }
+    let new_content = new_lines.join("\n");
+    println!("Updating playlist: {} -> {}", target_rel.display(), new_rel.display());
+    if !replaced {
+        println!("{}", format!("Warning: Target line '{}' not found in playlist '{}'", target_rel.display(), playlist_path).yellow());
+        return Ok(());
+    }
+    std::fs::write(playlist_path, new_content)?;
+    Ok(())
 }
 
 fn main() {
