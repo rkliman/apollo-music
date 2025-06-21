@@ -688,7 +688,12 @@ fn generate_path_from_pattern(
     replacements: &Option<HashMap<String, String>>,
 ) -> String {
     let artist_sanitized = sanitize_filename_component(artist, replacements);
-    let albumartist_sanitized = sanitize_filename_component(albumartist, replacements); // You may want to pass albumartist if available
+    let mut albumartist_sanitized = "".to_string(); // Default to empty string if albumartist is not provided
+    if albumartist.is_empty() {
+        albumartist_sanitized = sanitize_filename_component(artist, replacements); // You may want to pass albumartist if available   
+    } else {
+        albumartist_sanitized = sanitize_filename_component(albumartist, replacements); // You may want to pass albumartist if available
+    }
     let album_sanitized = sanitize_filename_component(album, replacements);
     let title_sanitized = sanitize_filename_component(title, replacements);
     let ext_sanitized = sanitize_filename_component(ext, replacements);
