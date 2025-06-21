@@ -1,11 +1,11 @@
 use config as app_config;
-use fs_extra::file;
 use lofty::file::TaggedFileExt;
 use lofty::prelude::ItemKey;
 use clap::{Parser, Subcommand, ArgAction};
 use serde::Deserialize;
 use shellexpand;
 use walkdir; // Add walkdir import
+use std::path::Path;
 use std::fs;
 use strsim;
 use colored::*;
@@ -644,8 +644,6 @@ fn extract_song_name_from_filename(filename: &str) -> Option<String> {
 }
 
 fn update_playlist_line(playlist_path: &str, target_line: &str, new_line: &str) -> std::io::Result<()> {
-    use std::path::{Path, PathBuf};
-
     let content = std::fs::read_to_string(playlist_path)?;
     let playlist_dir = Path::new(playlist_path).parent().unwrap_or_else(|| Path::new(""));
 
@@ -689,12 +687,12 @@ fn generate_path_from_pattern(
     replacements: &Option<HashMap<String, String>>,
 ) -> String {
     let artist_sanitized = sanitize_filename_component(artist, replacements);
-    let mut albumartist_sanitized = "".to_string(); // Default to empty string if albumartist is not provided
-    if albumartist.is_empty() || albumartist == "Various Artists" {
-        albumartist_sanitized = sanitize_filename_component(artist, replacements); // You may want to pass albumartist if available   
+    // Use artist as albumartist if albumartist is empty or "Various Artists", otherwise use albumartist
+    let albumartist_sanitized = if albumartist.trim().is_empty() || albumartist.trim().eq_ignore_ascii_case("Various Artists") {
+        sanitize_filename_component(artist, replacements)
     } else {
-        albumartist_sanitized = sanitize_filename_component(albumartist, replacements); // You may want to pass albumartist if available
-    }
+        sanitize_filename_component(albumartist, replacements)
+    };
     let album_sanitized = sanitize_filename_component(album, replacements);
     let title_sanitized = sanitize_filename_component(title, replacements);
     let ext_sanitized = sanitize_filename_component(ext, replacements);
@@ -712,7 +710,6 @@ fn main() {
 
     let music_dir = shellexpand::tilde(&settings.files.music_directory).to_string();
     let db_path = shellexpand::tilde(&settings.files.database_name).to_string();
-    let file_pattern = settings.files.file_pattern.as_deref();
 
     let db_folder = std::path::Path::new(&db_path).parent().unwrap();
     if !std::path::Path::new(&db_folder).exists() {
