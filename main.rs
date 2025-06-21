@@ -689,7 +689,7 @@ fn generate_path_from_pattern(
 ) -> String {
     let artist_sanitized = sanitize_filename_component(artist, replacements);
     let mut albumartist_sanitized = "".to_string(); // Default to empty string if albumartist is not provided
-    if albumartist.is_empty() {
+    if albumartist.is_empty() || albumartist == "Various Artists" {
         albumartist_sanitized = sanitize_filename_component(artist, replacements); // You may want to pass albumartist if available   
     } else {
         albumartist_sanitized = sanitize_filename_component(albumartist, replacements); // You may want to pass albumartist if available
@@ -722,7 +722,7 @@ fn main() {
     match args.command {
         Commands::Index { dry_run } => {
             index_library(&settings, dry_run);
-            index_playlists(&music_dir, &db_path);
+            // index_playlists(&music_dir, &db_path);
         }
         Commands::Dupes { fix } => {
             find_duplicates(&db_path, fix);
