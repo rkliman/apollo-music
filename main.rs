@@ -380,46 +380,71 @@ fn index_playlists(music_dir: &str, db_path: &str) {
                                     println!("  Top suggestions for '{}':", song_file_name);
                                     let mut options: Vec<String> = top_suggestions
                                         .iter()
-                                        .map(|(_, suggestion)| suggestion.clone())
+                                        .map(|(score, suggestion)| format!("({:.3}) {} ", score, suggestion))
                                         .collect();
                                     options.push("Remove".to_string());
                                     options.push("Skip".to_string());
 
-                                    // Use inquire to let user select a replacement or skip
-                                    match inquire::Select::new(
-                                        &format!("Select a replacement for '{}':", song_file_name),
-                                        options.clone(),
-                                    ).prompt() {
-                                        Ok(selected) if selected != "Skip" && selected != "Remove" => {
-                                            // Replace the missing song in the playlist file
-                                            println!("  Replacing '{}' with '{}'", song_path.display(), selected);
-                                            let new_content: String = content.lines()
-                                                .map(|line| {
-                                                    if line.trim() == trimmed {
-                                                        selected.clone()
-                                                    } else {
-                                                        line.to_string()
-                                                    }
-                                                })
-                                                .collect::<Vec<_>>()
-                                                .join("\n");
-                                            if let Err(e) = std::fs::write(path, new_content) {
-                                                eprintln!("Failed to update playlist file: {}", e);
-                                            }   
+                                    // Auto-replace if top suggestion is very similar
+                                    let (top_score, top_path) = &top_suggestions[0];
+                                    if *top_score >= 0.9 {
+                                        println!("  Auto-replacing '{}' with '{}' (similarity {:.3})", song_path.display(), top_path, top_score);
+                                        let new_content: String = content.lines()
+                                            .map(|line| {
+                                                if line.trim() == trimmed {
+                                                    top_path.clone()
+                                                } else {
+                                                    line.to_string()
+                                                }
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join("\n");
+                                        if let Err(e) = std::fs::write(path, new_content) {
+                                            eprintln!("Failed to update playlist file: {}", e);
                                         }
-                                        Ok(selected) if selected == "Remove" => {
-                                            // Remove the missing song from the playlist file
-                                            println!("  Removing '{}' from playlist", song_path.display());
-                                            let new_content: String = content.lines()
-                                                .filter(|line| line.trim() != trimmed)
-                                                .collect::<Vec<_>>()
-                                                .join("\n");
-                                            if let Err(e) = std::fs::write(path, new_content) {
-                                                eprintln!("Failed to update playlist file: {}", e);
+                                    } else {
+                                        // Use inquire to let user select a replacement or skip
+                                        match inquire::Select::new(
+                                            &format!("Select a replacement for '{}':", song_file_name),
+                                            options.clone(),
+                                        ).prompt() {
+                                            Ok(selected) if selected != "Skip" && selected != "Remove" => {
+                                                // Extract the path from the selected option (before the space)
+                                                // Extract the path from the selected option: format is "(score) path"
+                                                let selected_path = selected
+                                                    .splitn(2, ')')
+                                                    .nth(1)
+                                                    .map(|s| s.trim())
+                                                    .unwrap_or(&selected);
+                                                println!("  Replacing '{}' with '{}'", song_path.display(), selected_path);
+                                                let new_content: String = content.lines()
+                                                    .map(|line| {
+                                                        if line.trim() == trimmed {
+                                                            selected_path.to_string()
+                                                        } else {
+                                                            line.to_string()
+                                                        }
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                                    .join("\n");
+                                                if let Err(e) = std::fs::write(path, new_content) {
+                                                    eprintln!("Failed to update playlist file: {}", e);
+                                                }   
                                             }
-                                        }
-                                        Ok(_) | Err(_) => {
-                                            println!("  Skipped replacement for '{}'", song_path.display());
+                                            Ok(selected) if selected == "Remove" => {
+                                                // Remove the missing song from the playlist file
+                                                println!("  Removing '{}' from playlist", song_path.display());
+                                                let new_content: String = content.lines()
+                                                    .filter(|line| line.trim() != trimmed)
+                                                    .collect::<Vec<_>>()
+                                                    .join("\n");
+                                                if let Err(e) = std::fs::write(path, new_content) {
+                                                    eprintln!("Failed to update playlist file: {}", e);
+                                                }
+                                            }
+                                            Ok(_) | Err(_) => {
+                                                println!("  Skipped replacement for '{}'", song_path.display());
+                                            }
                                         }
                                     }
                                 }
