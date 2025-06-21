@@ -184,7 +184,7 @@ fn index_library(settings: &Settings, dry_run: bool) {
                 }
 
                 let result = tx.execute(
-                    "INSERT OR IGNORE INTO tracks (path, artist, album, albumartist, title, duration) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT OR IGNORE INTO tracks (path, artist, albumartist, album, title, duration) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     [
                         &path_str as &dyn rusqlite::ToSql,
                         &artist,
@@ -598,6 +598,7 @@ fn get_stats(music_dir: &str, db_path: &str) {
 }
 
 fn get_duration_with_symphonia(path: &std::path::Path) -> i64 {
+    println!("Calculating duration for: {}", path.display());
     let file = match File::open(path) {
         Ok(f) => f,
         Err(_) => return 0,
@@ -722,7 +723,7 @@ fn main() {
     match args.command {
         Commands::Index { dry_run } => {
             index_library(&settings, dry_run);
-            // index_playlists(&music_dir, &db_path);
+            index_playlists(&music_dir, &db_path);
         }
         Commands::Dupes { fix } => {
             find_duplicates(&db_path, fix);
