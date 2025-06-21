@@ -16,6 +16,7 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::default::{get_probe};
 use std::fs::File;
 use indicatif::{ProgressBar, ProgressStyle};
+use std::collections::HashMap; // Add this line
 
 
 /// Search for a pattern in a file and display the lines that contain it.
@@ -57,12 +58,35 @@ struct FilesConfig {
 #[derive(Debug, Deserialize)]
 struct Settings {
     files: FilesConfig,
+    replace: Option<HashMap<String, String>>
 }
 
-fn index_library(music_dir: &str, db_path: &str, file_pattern: Option<&str>, dry_run: bool) {
-    // create or open the database
+fn sanitize_filename_component(s: &str, replacements: &Option<HashMap<String, String>>) -> String {
+    let mut result = String::with_capacity(s.len());
+    for c in s.chars() {
+        let mut replaced = false;
+        if let Some(map) = replacements {
+            for (from, to) in map {
+                if from.chars().count() == 1 && c == from.chars().next().unwrap() {
+                    result.push_str(to);
+                    replaced = true;
+                    break;
+                }
+            }
+        }
+        if !replaced {
+            result.push(c);
+        }
+    }
+    result
+}
 
-    let db_path = shellexpand::tilde(db_path).to_string();
+fn index_library(settings: &Settings, dry_run: bool) {
+    let music_dir = shellexpand::tilde(&settings.files.music_directory).to_string();
+    let db_path = shellexpand::tilde(&settings.files.database_name).to_string();
+    let file_pattern = settings.files.file_pattern.as_deref();
+
+    // create or open the database
     let mut conn = rusqlite::Connection::open(db_path).expect("Failed to open database");
 
     conn.execute(
@@ -135,11 +159,13 @@ fn index_library(music_dir: &str, db_path: &str, file_pattern: Option<&str>, dry
                     let new_rel_path = generate_path_from_pattern(
                         pattern,
                         &artist,
+                        &albumartist,
                         &album,
                         &title,
                         ext,
+                        &settings.replace, // <-- Pass the replacements from settings
                     );
-                    let new_abs_path = std::path::Path::new(music_dir).join(&new_rel_path);
+                    let new_abs_path = std::path::Path::new(&music_dir).join(&new_rel_path);
                     if new_abs_path != path {
                         if dry_run {
                             println!(
@@ -655,16 +681,24 @@ fn update_playlist_line(playlist_path: &str, target_line: &str, new_line: &str) 
 fn generate_path_from_pattern(
     pattern: &str,
     artist: &str,
+    albumartist: &str,
     album: &str,
     title: &str,
     ext: &str,
+    replacements: &Option<HashMap<String, String>>,
 ) -> String {
+    let artist_sanitized = sanitize_filename_component(artist, replacements);
+    let albumartist_sanitized = sanitize_filename_component(albumartist, replacements); // You may want to pass albumartist if available
+    let album_sanitized = sanitize_filename_component(album, replacements);
+    let title_sanitized = sanitize_filename_component(title, replacements);
+    let ext_sanitized = sanitize_filename_component(ext, replacements);
+
     pattern
-        .replace("{artist}", artist)
-        .replace("{albumartist}", artist)
-        .replace("{album}", album)
-        .replace("{title}", title)
-        .replace("{ext}", ext)
+        .replace("{artist}", &artist_sanitized)
+        .replace("{albumartist}", &albumartist_sanitized)
+        .replace("{album}", &album_sanitized)
+        .replace("{title}", &title_sanitized)
+        .replace("{ext}", &ext_sanitized)
 }
 
 fn main() {
@@ -682,7 +716,7 @@ fn main() {
     let args = Cli::parse();
     match args.command {
         Commands::Index { dry_run } => {
-            index_library(&music_dir, &db_path, file_pattern, dry_run);
+            index_library(&settings, dry_run);
             index_playlists(&music_dir, &db_path);
         }
         Commands::Dupes { fix } => {
