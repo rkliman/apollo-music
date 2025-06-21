@@ -358,19 +358,19 @@ fn index_playlists(music_dir: &str, db_path: &str) {
 
                             // Suggest similar files in the music directory
                             let song_file_name = song_path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+                            let song_name = extract_song_name_from_filename(song_file_name)
+                                .unwrap_or_else(|| song_file_name.to_string());
+                            println!("  Suggested song name: {}", song_name);
                             if !song_file_name.is_empty() {
                                 let db_path = shellexpand::tilde(&db_path).to_string();
                                 let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
-                                let mut stmt = conn.prepare("SELECT path FROM tracks").expect("Failed to prepare statement");
+                                let mut stmt = conn.prepare("SELECT title, path FROM tracks").expect("Failed to prepare statement");
                                 let mut suggestions = Vec::new();
                                 let mut rows = stmt.query([]).expect("Failed to execute query");
                                 while let Some(row) = rows.next().expect("Failed to fetch row") {
-                                    let candidate_path: String = row.get(0).expect("Failed to get path");
-                                    let candidate_file_name = std::path::Path::new(&candidate_path)
-                                        .file_name()
-                                        .and_then(|f| f.to_str())
-                                        .unwrap_or("");
-                                    let score = strsim::jaro(candidate_file_name, song_file_name);
+                                    let candidate_title: String = row.get(0).expect("Failed to get title");
+                                    let candidate_path: String = row.get(1).expect("Failed to get path");
+                                    let score = strsim::jaro(&candidate_title, &song_name);
                                     suggestions.push((score, candidate_path));
                                 }
                                 // Sort by descending similarity score and take top 5
@@ -586,6 +586,28 @@ fn get_duration_with_symphonia(path: &std::path::Path) -> i64 {
         tb.calc_time(dur).seconds as i64
     } else {
         0
+    }
+}
+
+fn extract_song_name_from_filename(filename: &str) -> Option<String> {
+    // Remove extension
+    let file_stem = std::path::Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())?;
+    // Split on " - " and take the second part as song name
+    let parts1: Vec<&str> = file_stem.split(" - ").collect();
+    let parts2: Vec<&str> = file_stem.split(" － ").collect();
+    println!("Parts: {:?}", parts1);
+    println!("Parts: {:?}", parts2);
+    if parts1.len() > 1 {
+        return Some(parts1[1].to_string());
+    }
+    else if parts2.len() > 1 {
+        return Some(parts2[1].to_string());
+        
+    }
+    else {
+        return None;
     }
 }
 
