@@ -28,7 +28,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Index the music library and playlists
-    Index,
+    Index {
+        /// Show what would be moved but don't actually move files
+        #[arg(long, action = ArgAction::SetTrue)]
+        dry_run: bool,
+    },
     /// Find duplicate tracks
     Dupes {
         /// Interactively fix duplicates
@@ -55,7 +59,7 @@ struct Settings {
     files: FilesConfig,
 }
 
-fn index_library(music_dir: &str, db_path: &str, file_pattern: Option<&str>) {
+fn index_library(music_dir: &str, db_path: &str, file_pattern: Option<&str>, dry_run: bool) {
     // create or open the database
 
     let db_path = shellexpand::tilde(db_path).to_string();
@@ -67,6 +71,7 @@ fn index_library(music_dir: &str, db_path: &str, file_pattern: Option<&str>) {
             path TEXT NOT NULL UNIQUE,
             artist TEXT,
             album TEXT,
+            albumartist TEXT,
             title TEXT,
             duration INTEGER
         )",
@@ -109,15 +114,16 @@ fn index_library(music_dir: &str, db_path: &str, file_pattern: Option<&str>) {
 
     for entry in entries {
         let path = entry.path();
-        let (artist, album, title) = match lofty::read_from_path(path) {
+        let (artist, album, albumartist, title) = match lofty::read_from_path(path) {
             Ok(tagged_file) => {
                 let tag = tagged_file.primary_tag();
                 let artist = tag.and_then(|t| t.get_string(&ItemKey::TrackArtist)).unwrap_or("").to_string();
+                let albumartist = tag.and_then(|t| t.get_string(&ItemKey::AlbumArtist)).unwrap_or("").to_string();
                 let album = tag.and_then(|t| t.get_string(&ItemKey::AlbumTitle)).unwrap_or("").to_string();
                 let title = tag.and_then(|t| t.get_string(&ItemKey::TrackTitle)).unwrap_or("").to_string();
-                (artist, album, title)
+                (artist, album, albumartist, title)
             }
-            Err(_) => ("".to_string(), "".to_string(), "".to_string()),
+            Err(_) => ("".to_string(), "".to_string(), "".to_string(), "".to_string()),
         };
 
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -135,19 +141,28 @@ fn index_library(music_dir: &str, db_path: &str, file_pattern: Option<&str>) {
                     );
                     let new_abs_path = std::path::Path::new(music_dir).join(&new_rel_path);
                     if new_abs_path != path {
-                        if let Some(parent) = new_abs_path.parent() {
-                            std::fs::create_dir_all(parent).ok();
+                        if dry_run {
+                            println!(
+                                "[dry-run] Would move:\n  from: {}\n  to:   {}",
+                                path.display(),
+                                new_abs_path.display()
+                            );
+                        } else {
+                            if let Some(parent) = new_abs_path.parent() {
+                                std::fs::create_dir_all(parent).ok();
+                            }
+                            std::fs::rename(path, &new_abs_path).ok();
                         }
-                        std::fs::rename(path, &new_abs_path).ok();
                         path_str = new_abs_path.to_string_lossy().to_string();
                     }
                 }
 
                 let result = tx.execute(
-                    "INSERT OR IGNORE INTO tracks (path, artist, album, title, duration) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT OR IGNORE INTO tracks (path, artist, album, albumartist, title, duration) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     [
                         &path_str as &dyn rusqlite::ToSql,
                         &artist,
+                        &albumartist,
                         &album,
                         &title,
                         &0.0 as &dyn rusqlite::ToSql,
@@ -646,6 +661,7 @@ fn generate_path_from_pattern(
 ) -> String {
     pattern
         .replace("{artist}", artist)
+        .replace("{albumartist}", artist)
         .replace("{album}", album)
         .replace("{title}", title)
         .replace("{ext}", ext)
@@ -665,8 +681,8 @@ fn main() {
 
     let args = Cli::parse();
     match args.command {
-        Commands::Index => {
-            index_library(&music_dir, &db_path);
+        Commands::Index { dry_run } => {
+            index_library(&music_dir, &db_path, file_pattern, dry_run);
             index_playlists(&music_dir, &db_path);
         }
         Commands::Dupes { fix } => {
