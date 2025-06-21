@@ -43,6 +43,8 @@
             exiftool          # If handling metadata in media files
             git               # For version control
             jq                # For JSON processing in scripts
+            pkgs.alsa-lib     # If dealing with audio playback
+            mpd
           ];
         };
       });

@@ -19,6 +19,8 @@ fs_extra = "1.2.0"
 human_bytes = "0.4.3"
 symphonia = { version = "0.5", features = ["mp3", "flac", "wav"] }
 indicatif = "0.17.11"
+rodio = { version = "0.20.1", features = ["default", "mp3", "flac", "wav"] }
+mpd = { version = "0.1.0"}
 
 [[bin]]
 name = "apollo"

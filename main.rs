@@ -16,6 +16,8 @@ use symphonia::default::{get_probe};
 use std::fs::File;
 use indicatif::{ProgressBar, ProgressStyle};
 
+mod playback;
+
 
 /// Search for a pattern in a file and display the lines that contain it.
 #[derive(Parser)]
@@ -40,6 +42,18 @@ enum Commands {
     Export,
     /// Show statistics
     Stats,
+    /// Play a track
+    Play {
+        /// Play a playlist by name or path
+        #[arg(short = 'p', long = "playlist", value_name = "playlist", required = false, conflicts_with = "track_name")]
+        playlist: Option<String>,
+
+        /// The name of the track to play
+        #[arg(value_name = "track_name", required = false, conflicts_with = "playlist")]
+        track_name: Option<String>,
+    },
+    /// Stop playback
+    Stop,
 }
 
 #[derive(Debug, Deserialize)]
@@ -564,6 +578,29 @@ fn get_duration_with_symphonia(path: &std::path::Path) -> i64 {
     }
 }
 
+fn play(track_name: &Option<String>, playlist: &Option<String>, db_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(playlist_name) = playlist {
+        // Play a playlist
+        let db_path = shellexpand::tilde(db_path).to_string();
+        let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
+        let mut stmt = conn.prepare("SELECT path FROM playlists WHERE name = ?1").expect("Failed to prepare statement");
+        let mut rows = stmt.query([playlist_name])?;
+        
+        if let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            playback::play(&path)?;
+        } else {
+            eprintln!("Playlist '{}' not found", playlist_name);
+        }
+    } else if let Some(track) = track_name {
+        // Play a specific track
+        playback::play(track)?;
+    } else {
+        eprintln!("No track or playlist specified");
+    }
+    Ok(())
+}
+
 fn main() {
     let settings = load_settings();
 
@@ -592,6 +629,12 @@ fn main() {
         }
         Commands::Stats => {
             get_stats(&music_dir, &db_path);
+        }
+        Commands::Play { track_name, playlist } => {
+            play(&track_name, &playlist, &db_path).expect("Failed to play track");
+        }
+        Commands::Stop => {
+            playback::stop().expect("Failed to stop playback");
         }
     }
 }
