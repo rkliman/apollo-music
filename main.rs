@@ -1,4 +1,5 @@
 use config as app_config;
+use fs_extra::file;
 use lofty::file::TaggedFileExt;
 use lofty::prelude::ItemKey;
 use clap::{Parser, Subcommand, ArgAction};
@@ -46,6 +47,7 @@ enum Commands {
 struct FilesConfig {
     music_directory: String,
     database_name: String,
+    file_pattern: Option<String>, // Add this line
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,7 +55,7 @@ struct Settings {
     files: FilesConfig,
 }
 
-fn index_library(music_dir: &str, db_path: &str) {
+fn index_library(music_dir: &str, db_path: &str, file_pattern: Option<&str>) {
     // create or open the database
 
     let db_path = shellexpand::tilde(db_path).to_string();
@@ -118,11 +120,29 @@ fn index_library(music_dir: &str, db_path: &str) {
             Err(_) => ("".to_string(), "".to_string(), "".to_string()),
         };
 
-        // let duration = get_duration_with_symphonia(path);
-
-        if let Some(ext) = path.extension() {
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             if ext == "mp3" || ext == "flac" || ext == "wav" {
-                let path_str = path.to_string_lossy();
+                let mut path_str = path.to_string_lossy().to_string();
+
+                // Move file if pattern is set
+                if let Some(pattern) = file_pattern {
+                    let new_rel_path = generate_path_from_pattern(
+                        pattern,
+                        &artist,
+                        &album,
+                        &title,
+                        ext,
+                    );
+                    let new_abs_path = std::path::Path::new(music_dir).join(&new_rel_path);
+                    if new_abs_path != path {
+                        if let Some(parent) = new_abs_path.parent() {
+                            std::fs::create_dir_all(parent).ok();
+                        }
+                        std::fs::rename(path, &new_abs_path).ok();
+                        path_str = new_abs_path.to_string_lossy().to_string();
+                    }
+                }
+
                 let result = tx.execute(
                     "INSERT OR IGNORE INTO tracks (path, artist, album, title, duration) VALUES (?1, ?2, ?3, ?4, ?5)",
                     [
@@ -130,7 +150,7 @@ fn index_library(music_dir: &str, db_path: &str) {
                         &artist,
                         &album,
                         &title,
-                        &0.0 as &dyn rusqlite::ToSql, // Placeholder for duration
+                        &0.0 as &dyn rusqlite::ToSql,
                     ]
                 );
                 if let Ok(1) = result {
@@ -617,11 +637,26 @@ fn update_playlist_line(playlist_path: &str, target_line: &str, new_line: &str) 
     Ok(())
 }
 
+fn generate_path_from_pattern(
+    pattern: &str,
+    artist: &str,
+    album: &str,
+    title: &str,
+    ext: &str,
+) -> String {
+    pattern
+        .replace("{artist}", artist)
+        .replace("{album}", album)
+        .replace("{title}", title)
+        .replace("{ext}", ext)
+}
+
 fn main() {
     let settings = load_settings();
 
     let music_dir = shellexpand::tilde(&settings.files.music_directory).to_string();
     let db_path = shellexpand::tilde(&settings.files.database_name).to_string();
+    let file_pattern = settings.files.file_pattern.as_deref();
 
     let db_folder = std::path::Path::new(&db_path).parent().unwrap();
     if !std::path::Path::new(&db_folder).exists() {
