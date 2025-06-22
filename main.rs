@@ -121,7 +121,8 @@ fn index_library(settings: &Settings, dry_run: bool) {
             album TEXT,
             albumartist TEXT,
             title TEXT,
-            duration INTEGER
+            duration INTEGER,
+            year INTEGER
         )",
         [],
     ).expect("Failed to create table");
@@ -156,16 +157,20 @@ fn index_library(settings: &Settings, dry_run: bool) {
 
     for entry in entries {
         let path = entry.path();
-        let (artist, album, albumartist, title) = match lofty::read_from_path(path) {
+        let (artist, album, albumartist, title, year) = match lofty::read_from_path(path) {
             Ok(tagged_file) => {
                 let tag = tagged_file.primary_tag();
                 let artist = tag.and_then(|t| t.get_string(&ItemKey::TrackArtist)).unwrap_or("").to_string();
                 let albumartist = tag.and_then(|t| t.get_string(&ItemKey::AlbumArtist)).unwrap_or("").to_string();
                 let album = tag.and_then(|t| t.get_string(&ItemKey::AlbumTitle)).unwrap_or("").to_string();
                 let title = tag.and_then(|t| t.get_string(&ItemKey::TrackTitle)).unwrap_or("").to_string();
-                (artist, album, albumartist, title)
+                let year = tag
+                    .and_then(|t| t.get_string(&ItemKey::Year))
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(0);
+                (artist, album, albumartist, title, year)
             }
-            Err(_) => ("".to_string(), "".to_string(), "".to_string(), "".to_string()),
+            Err(_) => ("".to_string(), "".to_string(), "".to_string(), "".to_string(), 0),
         };
 
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -202,7 +207,7 @@ fn index_library(settings: &Settings, dry_run: bool) {
                 }
 
                 let result = tx.execute(
-                    "INSERT OR IGNORE INTO tracks (path, artist, albumartist, album, title, duration) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT OR IGNORE INTO tracks (path, artist, albumartist, album, title, duration, year) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     [
                         &path_str as &dyn rusqlite::ToSql,
                         &artist,
@@ -210,6 +215,7 @@ fn index_library(settings: &Settings, dry_run: bool) {
                         &album,
                         &title,
                         &0.0 as &dyn rusqlite::ToSql,
+                        &year,
                     ]
                 );
                 if let Ok(1) = result {
@@ -568,14 +574,28 @@ fn get_stats(music_dir: &str, db_path: &str) {
     // update durations if they are zero
     let mut stmt = conn.prepare("SELECT id, path, duration FROM tracks WHERE duration = 0").expect("Failed to prepare statement");
     let mut rows = stmt.query([]).expect("Failed to execute query");
+    // Collect all rows first to know the total count for the progress bar
+    let mut rows_vec = Vec::new();
     while let Some(row) = rows.next().expect("Failed to fetch row") {
         let id: i64 = row.get(0).expect("Failed to get id");
         let path: String = row.get(1).expect("Failed to get path");
+        rows_vec.push((id, path));
+    }
+
+    let pb = ProgressBar::new(rows_vec.len() as u64);
+    pb.set_style(ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+        .unwrap()
+        .progress_chars("##-"));
+
+    for (id, path) in rows_vec {
         let duration: f64 = get_duration_with_symphonia(std::path::Path::new(&path)) as f64;
         if duration > 0.0 {
             conn.execute("UPDATE tracks SET duration = ?1 WHERE id = ?2", [duration, id as f64]).expect("Failed to update duration");
         }
+        pb.inc(1);
+        pb.set_message(format!("{}", path));
     }
+    pb.finish_with_message("Duration update complete");
     
     let total_duration: f64 = conn.query_row(
         "SELECT SUM(duration) FROM tracks",
@@ -613,10 +633,35 @@ fn get_stats(music_dir: &str, db_path: &str) {
     println!("Total albums: {}", total_albums);
     println!("Total size: {}", folder_size);
     println!("Total time: {}", format_duration(total_duration));
+
+    // --- Date Histogram ---
+    println!("\nTracks by Year:");
+    let mut stmt = conn.prepare(
+        "SELECT year, COUNT(*) FROM tracks WHERE year IS NOT NULL AND year > 0 GROUP BY year ORDER BY year"
+    ).expect("Failed to prepare year histogram statement");
+    let mut rows = stmt.query([]).expect("Failed to execute year histogram query");
+
+    // Collect year counts
+    let mut year_counts = Vec::new();
+    let mut max_count = 0;
+    while let Some(row) = rows.next().expect("Failed to fetch year row") {
+        let year: i64 = row.get(0).unwrap_or(0);
+        let count: i64 = row.get(1).unwrap_or(0);
+        if count > max_count {
+            max_count = count;
+        }
+        year_counts.push((year, count));
+    }
+
+    // Print histogram
+    for (year, count) in year_counts {
+        let bar_len = if max_count > 0 { (count * 40 / max_count) as usize } else { 0 };
+        let bar = "█".repeat(bar_len);
+        println!("{:4}: {:4} {}", year, count, bar);
+    }
 }
 
 fn get_duration_with_symphonia(path: &std::path::Path) -> i64 {
-    println!("Calculating duration for: {}", path.display());
     let file = match File::open(path) {
         Ok(f) => f,
         Err(_) => return 0,
