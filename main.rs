@@ -42,7 +42,11 @@ enum Commands {
         fix: bool,
     },
     /// List all tracks
-    Ls,
+    Ls {
+        /// Search Query
+        #[arg()]
+        query: Option<String>,
+    },
     /// Export tracks to CSV
     Export,
     /// Show statistics
@@ -515,12 +519,29 @@ fn index_playlists(music_dir: &str, db_path: &str) {
     tx.commit().expect("Failed to commit transaction");
 }
 
-fn list_tracks(db_path: &str) {
+fn list_tracks(db_path: &str, query: Option<String>) {
     let db_path = shellexpand::tilde(db_path).to_string();
     let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
 
-    let mut stmt = conn.prepare("SELECT artist, album, title FROM tracks").expect("Failed to prepare statement");
-    let mut rows = stmt.query([]).expect("Failed to execute query");
+    let (sql, params): (&str, Vec<String>) = if let Some(q) = query {
+        let pattern = format!("%{}%", q);
+        (
+            "SELECT artist, album, title FROM tracks WHERE artist LIKE ?1 OR album LIKE ?1 OR title LIKE ?1",
+            vec![pattern],
+        )
+    } else {
+        (
+            "SELECT artist, album, title FROM tracks",
+            vec![],
+        )
+    };
+
+    let mut stmt = conn.prepare(sql).expect("Failed to prepare statement");
+    let mut rows = if params.is_empty() {
+        stmt.query([]).expect("Failed to execute query")
+    } else {
+        stmt.query([&params[0]]).expect("Failed to execute query")
+    };
 
     println!("Track - Artist - Album");
     while let Some(row) = rows.next().expect("Failed to fetch row") {
@@ -788,8 +809,8 @@ fn main() {
         Commands::Dupes { fix } => {
             find_duplicates(&db_path, fix);
         }
-        Commands::Ls => {
-            list_tracks(&db_path);
+        Commands::Ls { query } => {
+            list_tracks(&db_path, query);
         }
         Commands::Export => {
             export_tracks(&db_path);
