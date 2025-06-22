@@ -51,6 +51,12 @@ enum Commands {
     Export,
     /// Show statistics
     Stats,
+    /// Search library
+    Search {
+        /// Search Query
+        #[arg(required = true)]
+        query: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -551,34 +557,8 @@ fn search_db(db_path: &str, statement: &str, query: &str) -> Vec<(String, String
     results
 }
 
-fn list_tracks(db_path: &str, query: Option<String>) {
+fn search_tracks(db_path: &str, query: Option<String>) {
     let db_path = shellexpand::tilde(db_path).to_string();
-
-    if query.is_none() {
-        let statement = "SELECT artist, album, title FROM tracks ORDER BY artist, album, title";
-        let results = search_db(&db_path, statement, "");
-        if results.is_empty() {
-            println!("{}", "No tracks found.".yellow());
-            return;
-        }
-
-        // Group by artist and album
-        let mut last_artist = String::new();
-        let mut last_album = String::new();
-        for (artist, album, title) in results {
-            if artist != last_artist {
-                println!("\n{}:", artist.bold());
-                last_artist = artist.clone();
-                last_album.clear();
-            }
-            if album != last_album {
-                println!("  {}:", album.cyan());
-                last_album = album.clone();
-            }
-            println!("    {}", title);
-        }
-        return;
-    }
 
     // Display Tracks (flat list for search)
     println!("{} {}", "Tracks".bold().underline(), "(Track - Album - Artist)");
@@ -627,6 +607,59 @@ fn list_tracks(db_path: &str, query: Option<String>) {
         let unique_artists = results.iter().map(|(_, artist, _)| artist).collect::<std::collections::HashSet<_>>();
         for artist in unique_artists {
             println!("{}", artist);
+        }
+    }
+
+}
+
+fn list_tracks(db_path: &str, query: Option<String>) {
+    let db_path = shellexpand::tilde(db_path).to_string();
+
+    if query.is_none() {
+        let statement = "SELECT artist, album, title FROM tracks ORDER BY artist, album, title";
+        let results = search_db(&db_path, statement, "");
+        if results.is_empty() {
+            println!("{}", "No tracks found.".yellow());
+            return;
+        }
+
+        // Group by artist and album
+        let mut last_artist = String::new();
+        let mut last_album = String::new();
+        for (artist, album, title) in results {
+            if artist != last_artist {
+                println!("\n{}:", artist.bold());
+                last_artist = artist.clone();
+                last_album.clear();
+            }
+            if album != last_album {
+                println!("  {}:", album.cyan());
+                last_album = album.clone();
+            }
+            println!("    {}", title);
+        }
+    } else {
+        let statement = "SELECT album, artist, title FROM tracks WHERE album LIKE ?1 OR artist LIKE ?1 OR title LIKE ?1 ORDER BY album, artist, title";
+        let results = search_db(&db_path, statement, &query.as_ref().unwrap());
+        if results.is_empty() {
+            println!("{}", "No tracks found.".yellow());
+            return;
+        }
+
+        // Group by artist and album
+        let mut last_artist = String::new();
+        let mut last_album = String::new();
+        for (artist, album, title) in results {
+            if artist != last_artist {
+                println!("\n{}:", artist.bold());
+                last_artist = artist.clone();
+                last_album.clear();
+            }
+            if album != last_album {
+                println!("  {}:", album.cyan());
+                last_album = album.clone();
+            }
+            println!("    {}", title);
         }
     }
 }
@@ -891,6 +924,9 @@ fn main() {
         }
         Commands::Stats => {
             get_stats(&music_dir, &db_path);
+        }
+        Commands::Search { query } => {
+            search_tracks(&db_path, Some(query));
         }
     }
 }
