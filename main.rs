@@ -522,41 +522,112 @@ fn index_playlists(music_dir: &str, db_path: &str) {
     tx.commit().expect("Failed to commit transaction");
 }
 
-fn list_tracks(db_path: &str, query: Option<String>) {
+fn search_db(db_path: &str, statement: &str, query: &str) -> Vec<(String, String, String)> {
     let db_path = shellexpand::tilde(db_path).to_string();
     let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
 
-    let (sql, params): (&str, Vec<String>) = if let Some(q) = query {
-        let pattern = format!("%{}%", q);
-        (
-            "SELECT artist, album, title FROM tracks WHERE artist LIKE ?1 OR album LIKE ?1 OR title LIKE ?1",
-            vec![pattern],
-        )
-    } else {
-        (
-            "SELECT artist, album, title FROM tracks",
-            vec![],
-        )
-    };
+    let mut stmt = conn.prepare(statement).expect("Failed to prepare statement");
 
-    let mut stmt = conn.prepare(sql).expect("Failed to prepare statement");
-    let mut rows = if params.is_empty() {
-        stmt.query([]).expect("Failed to execute query")
+    let mut results = Vec::new();
+    // Only pass a parameter if the statement contains ?1
+    if statement.contains("?1") {
+        let pattern = format!("%{}%", query);
+        let mut rows = stmt.query([&pattern]).expect("Failed to execute query");
+        while let Some(row) = rows.next().expect("Failed to fetch row") {
+            let artist: String = row.get(0).unwrap_or_default();
+            let album: String = row.get(1).unwrap_or_default();
+            let title: String = row.get(2).unwrap_or_default();
+            results.push((artist, album, title));
+        }
     } else {
-        stmt.query([&params[0]]).expect("Failed to execute query")
-    };
+        let mut rows = stmt.query([]).expect("Failed to execute query");
+        while let Some(row) = rows.next().expect("Failed to fetch row") {
+            let artist: String = row.get(0).unwrap_or_default();
+            let album: String = row.get(1).unwrap_or_default();
+            let title: String = row.get(2).unwrap_or_default();
+            results.push((artist, album, title));
+        }
+    }
+    results
+}
 
-    println!("Track - Artist - Album");
-    while let Some(row) = rows.next().expect("Failed to fetch row") {
-        let artist: String = row.get(0).unwrap_or_default();
-        let album: String = row.get(1).unwrap_or_default();
-        let title: String = row.get(2).unwrap_or_default();
-        println!(
-            "{} - {} - {}",
-            title,
-            artist,
-            album
-        );
+fn list_tracks(db_path: &str, query: Option<String>) {
+    let db_path = shellexpand::tilde(db_path).to_string();
+
+    if query.is_none() {
+        let statement = "SELECT artist, album, title FROM tracks ORDER BY artist, album, title";
+        let results = search_db(&db_path, statement, "");
+        if results.is_empty() {
+            println!("{}", "No tracks found.".yellow());
+            return;
+        }
+
+        // Group by artist and album
+        let mut last_artist = String::new();
+        let mut last_album = String::new();
+        for (artist, album, title) in results {
+            if artist != last_artist {
+                println!("\n{}:", artist.bold());
+                last_artist = artist.clone();
+                last_album.clear();
+            }
+            if album != last_album {
+                println!("  {}:", album.cyan());
+                last_album = album.clone();
+            }
+            println!("    {}", title);
+        }
+        return;
+    }
+
+    // Display Tracks (flat list for search)
+    println!("{} {}", "Tracks".bold().underline(), "(Track - Album - Artist)");
+    let statement = "SELECT artist, album, title FROM tracks WHERE title LIKE ?1 ORDER BY artist, album, title";
+    let results = if let Some(ref q) = query {
+        search_db(&db_path, statement, q)
+    } else {
+        search_db(&db_path, statement, "")
+    };
+    if results.is_empty() {
+        println!("{}", "No tracks found.".yellow());
+    } else {
+        for (artist, album, title) in results {
+            println!("{} - {} - {}", title, album, artist);
+        }
+    }
+    println!("");
+
+    println!("{}", "Albums".bold().underline());
+    let statement = "SELECT album, artist, title FROM tracks WHERE album LIKE ?1 ORDER BY album, artist, title";
+    let results = if let Some(ref q) = query {
+        search_db(&db_path, statement, q)
+    } else {
+        search_db(&db_path, statement, "")
+    };
+    if results.is_empty() {
+        println!("{}", "No albums found.".yellow());
+    } else {
+        let unique_albums = results.iter().map(|(album, _, _)| album).collect::<std::collections::HashSet<_>>();
+        for album in unique_albums {
+            println!("{}", album);
+        }
+    }
+    println!("");
+
+    println!("{}", "Artists".bold().underline());
+    let statement = "SELECT album, artist, title FROM tracks WHERE artist LIKE ?1 ORDER BY album, artist, title";
+    let results = if let Some(ref q) = query {
+        search_db(&db_path, statement, q)
+    } else {
+        search_db(&db_path, statement, "")
+    };
+    if results.is_empty() {
+        println!("{}", "No artists found.".yellow());
+    } else {
+        let unique_artists = results.iter().map(|(_, artist, _)| artist).collect::<std::collections::HashSet<_>>();
+        for artist in unique_artists {
+            println!("{}", artist);
+        }
     }
 }
 
