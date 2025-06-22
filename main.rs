@@ -126,7 +126,8 @@ fn index_library(settings: &Settings, dry_run: bool) {
             albumartist TEXT,
             title TEXT,
             duration INTEGER,
-            year INTEGER
+            year INTEGER,
+            genre TEXT
         )",
         [],
     ).expect("Failed to create table");
@@ -161,7 +162,7 @@ fn index_library(settings: &Settings, dry_run: bool) {
 
     for entry in entries {
         let path = entry.path();
-        let (artist, album, albumartist, title, year) = match lofty::read_from_path(path) {
+        let (artist, album, albumartist, title, year, genre) = match lofty::read_from_path(path) {
             Ok(tagged_file) => {
                 let tag = tagged_file.primary_tag();
                 let artist = tag.and_then(|t| t.get_string(&ItemKey::TrackArtist)).unwrap_or("").to_string();
@@ -172,9 +173,10 @@ fn index_library(settings: &Settings, dry_run: bool) {
                     .and_then(|t| t.get_string(&ItemKey::Year))
                     .and_then(|s| s.parse::<i32>().ok())
                     .unwrap_or(0);
-                (artist, album, albumartist, title, year)
+                let genre = tag.and_then(|t| t.get_string(&ItemKey::Genre)).unwrap_or("").to_string();
+                (artist, album, albumartist, title, year, genre)
             }
-            Err(_) => ("".to_string(), "".to_string(), "".to_string(), "".to_string(), 0),
+            Err(_) => ("".to_string(), "".to_string(), "".to_string(), "".to_string(), 0, "".to_string()),
         };
 
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -211,7 +213,7 @@ fn index_library(settings: &Settings, dry_run: bool) {
                 }
 
                 let result = tx.execute(
-                    "INSERT OR IGNORE INTO tracks (path, artist, albumartist, album, title, duration, year) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "INSERT OR IGNORE INTO tracks (path, artist, albumartist, album, title, duration, year, genre) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     [
                         &path_str as &dyn rusqlite::ToSql,
                         &artist,
@@ -220,6 +222,7 @@ fn index_library(settings: &Settings, dry_run: bool) {
                         &title,
                         &0.0 as &dyn rusqlite::ToSql,
                         &year,
+                        &genre,
                     ]
                 );
                 if let Ok(1) = result {
