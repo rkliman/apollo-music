@@ -639,7 +639,7 @@ fn list_tracks(db_path: &str, query: Option<String>) {
             println!("    {}", title);
         }
     } else {
-        let statement = "SELECT album, artist, title FROM tracks WHERE album LIKE ?1 OR artist LIKE ?1 OR title LIKE ?1 ORDER BY album, artist, title";
+        let statement = "SELECT artist, album, title FROM tracks WHERE album LIKE ?1 OR artist LIKE ?1 OR title LIKE ?1 ORDER BY album, artist, title";
         let results = search_db(&db_path, statement, &query.as_ref().unwrap());
         if results.is_empty() {
             println!("{}", "No tracks found.".yellow());
