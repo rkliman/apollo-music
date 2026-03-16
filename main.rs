@@ -61,6 +61,8 @@ enum Commands {
         #[arg(required = true)]
         query: String,
     },
+    /// List all genres
+    Genres,
 }
 
 #[derive(Debug, Deserialize)]
@@ -962,6 +964,40 @@ fn generate_path_from_pattern(
         .replace("{ext}", &ext_sanitized)
 }
 
+fn list_genres(db_path: &str) {
+    let db_path = shellexpand::tilde(db_path).to_string();
+    let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
+
+    let mut stmt = conn.prepare(
+        "SELECT genre FROM tracks WHERE genre != ''"
+    ).expect("Failed to prepare statement");
+
+    let mut rows = stmt.query([]).expect("Failed to execute query");
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    while let Some(row) = rows.next().expect("Failed to fetch row") {
+        let genre_str: String = row.get(0).unwrap_or_default();
+        for genre in genre_str.split(',') {
+            let genre = genre.trim().to_string();
+            if !genre.is_empty() {
+                *counts.entry(genre).or_insert(0) += 1;
+            }
+        }
+    }
+
+    if counts.is_empty() {
+        println!("{}", "No genres found.".yellow());
+        return;
+    }
+
+    let mut sorted: Vec<(String, usize)> = counts.into_iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (genre, count) in sorted {
+        println!("{:<30} {}", genre.bold(), format!("({} tracks)", count).yellow());
+    }
+}
+
 fn main() {
     let settings = load_settings();
 
@@ -993,6 +1029,9 @@ fn main() {
         }
         Commands::Search { query } => {
             search_tracks(&db_path, Some(query));
+        }
+        Commands::Genres => {
+            list_genres(&db_path);
         }
     }
 }
