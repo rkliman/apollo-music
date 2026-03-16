@@ -46,6 +46,10 @@ enum Commands {
         /// Search Query
         #[arg()]
         query: Option<String>,
+
+        /// Filter by genre
+        #[arg(long)]
+        genre: Option<String>,
     },
     /// Export tracks to CSV
     Export,
@@ -612,56 +616,118 @@ fn search_tracks(db_path: &str, query: Option<String>) {
 
 }
 
-fn list_tracks(db_path: &str, query: Option<String>) {
-    let db_path = shellexpand::tilde(db_path).to_string();
-
-    if query.is_none() {
-        let statement = "SELECT artist, album, title FROM tracks ORDER BY artist, album, title";
-        let results = search_db(&db_path, statement, "");
-        if results.is_empty() {
-            println!("{}", "No tracks found.".yellow());
-            return;
-        }
-
-        // Group by artist and album
-        let mut last_artist = String::new();
-        let mut last_album = String::new();
-        for (artist, album, title) in results {
-            if artist != last_artist {
-                println!("\n{}:", artist.bold());
-                last_artist = artist.clone();
-                last_album.clear();
-            }
-            if album != last_album {
-                println!("  {}:", album.cyan());
-                last_album = album.clone();
-            }
-            println!("    {}", title);
-        }
-    } else {
-        let statement = "SELECT artist, album, title FROM tracks WHERE album LIKE ?1 OR artist LIKE ?1 OR title LIKE ?1 ORDER BY artist, album, title";
-        let results = search_db(&db_path, statement, &query.as_ref().unwrap());
-        if results.is_empty() {
-            println!("{}", "No tracks found.".yellow());
-            return;
-        }
-
-        // Group by artist and album
-        let mut last_artist = String::new();
-        let mut last_album = String::new();
-        for (artist, album, title) in results {
-            if artist != last_artist {
-                println!("\n{}:", artist.bold());
-                last_artist = artist.clone();
-                last_album.clear();
-            }
-            if album != last_album {
-                println!("  {}:", album.cyan());
-                last_album = album.clone();
-            }
-            println!("    {}", title);
-        }
+fn print_grouped_tracks(results: Vec<(String, String, String)>) {
+    if results.is_empty() {
+        println!("{}", "No tracks found.".yellow());
+        return;
     }
+    let mut last_artist = String::new();
+    let mut last_album = String::new();
+    for (artist, album, title) in results {
+        if artist != last_artist {
+            println!("\n{}:", artist.bold());
+            last_artist = artist.clone();
+            last_album.clear();
+        }
+        if album != last_album {
+            println!("  {}:", album.cyan());
+            last_album = album.clone();
+        }
+        println!("    {}", title);
+    }
+}
+
+fn list_tracks(db_path: &str, query: Option<String>, genre: Option<String>) {
+    let db_path = shellexpand::tilde(db_path).to_string();
+    let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
+
+    // Print genre header if filtering
+    if let Some(ref g) = genre {
+        println!("{} {}", "Genre:".bold(), g.cyan());
+    }
+
+    let results: Vec<(String, String, String)> = match (&query, &genre) {
+        // No filters — list everything
+        (None, None) => {
+            let mut stmt = conn.prepare(
+                "SELECT artist, album, title FROM tracks ORDER BY artist, album, title"
+            ).expect("Failed to prepare statement");
+            let mut rows = stmt.query([]).expect("Failed to execute query");
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().expect("Failed to fetch row") {
+                out.push((
+                    row.get(0).unwrap_or_default(),
+                    row.get(1).unwrap_or_default(),
+                    row.get(2).unwrap_or_default(),
+                ));
+            }
+            out
+        }
+
+        // Genre only
+        (None, Some(g)) => {
+            let pattern = format!("%{}%", g);
+            let mut stmt = conn.prepare(
+                "SELECT artist, album, title FROM tracks \
+                 WHERE genre LIKE ?1 \
+                 ORDER BY artist, album, title"
+            ).expect("Failed to prepare statement");
+            let mut rows = stmt.query([&pattern]).expect("Failed to execute query");
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().expect("Failed to fetch row") {
+                out.push((
+                    row.get(0).unwrap_or_default(),
+                    row.get(1).unwrap_or_default(),
+                    row.get(2).unwrap_or_default(),
+                ));
+            }
+            out
+        }
+
+        // Query only
+        (Some(q), None) => {
+            let pattern = format!("%{}%", q);
+            let mut stmt = conn.prepare(
+                "SELECT artist, album, title FROM tracks \
+                 WHERE album LIKE ?1 OR artist LIKE ?1 OR title LIKE ?1 \
+                 ORDER BY artist, album, title"
+            ).expect("Failed to prepare statement");
+            let mut rows = stmt.query([&pattern]).expect("Failed to execute query");
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().expect("Failed to fetch row") {
+                out.push((
+                    row.get(0).unwrap_or_default(),
+                    row.get(1).unwrap_or_default(),
+                    row.get(2).unwrap_or_default(),
+                ));
+            }
+            out
+        }
+
+        // Both query and genre
+        (Some(q), Some(g)) => {
+            let q_pattern = format!("%{}%", q);
+            let g_pattern = format!("%{}%", g);
+            let mut stmt = conn.prepare(
+                "SELECT artist, album, title FROM tracks \
+                 WHERE genre LIKE ?1 \
+                 AND (album LIKE ?2 OR artist LIKE ?2 OR title LIKE ?2) \
+                 ORDER BY artist, album, title"
+            ).expect("Failed to prepare statement");
+            let mut rows = stmt.query([&g_pattern, &q_pattern]).expect("Failed to execute query");
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().expect("Failed to fetch row") {
+                out.push((
+                    row.get(0).unwrap_or_default(),
+                    row.get(1).unwrap_or_default(),
+                    row.get(2).unwrap_or_default(),
+                ));
+            }
+            out
+        }
+    };
+
+    print_grouped_tracks(results);
 }
 
 fn export_tracks(db_path: &str) {
@@ -916,8 +982,8 @@ fn main() {
         Commands::Dupes { fix } => {
             find_duplicates(&db_path, fix);
         }
-        Commands::Ls { query } => {
-            list_tracks(&db_path, query);
+        Commands::Ls { query, genre } => {
+            list_tracks(&db_path, query, genre);
         }
         Commands::Export => {
             export_tracks(&db_path);
