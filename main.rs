@@ -192,7 +192,7 @@ fn index_library(settings: &Settings, dry_run: bool) {
         };
 
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if ext == "mp3" || ext == "flac" || ext == "wav" {
+            if ext == "mp3" || ext == "flac" || ext == "wav" || ext == "m4a" {
                 let mut path_str = path.to_string_lossy().to_string();
 
                 // Move file if pattern is set
