@@ -11,9 +11,6 @@ use strsim;
 use colored::*;
 use fs_extra::dir::get_size;
 use human_bytes::human_bytes;
-use symphonia::core::probe::Hint;
-use symphonia::core::io::MediaSourceStream;
-use symphonia::default::{get_probe};
 use std::fs::File;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap; // Add this line
@@ -784,7 +781,7 @@ fn get_stats(music_dir: &str, db_path: &str) {
         .progress_chars("##-"));
 
     for (id, path) in rows_vec {
-        let duration: f64 = get_duration_with_symphonia(std::path::Path::new(&path)) as f64;
+        let duration: f64 = get_duration_with_lofty(std::path::Path::new(&path)) as f64;
         if duration > 0.0 {
             conn.execute("UPDATE tracks SET duration = ?1 WHERE id = ?2", [duration, id as f64]).expect("Failed to update duration");
         }
@@ -857,28 +854,12 @@ fn get_stats(music_dir: &str, db_path: &str) {
     }
 }
 
-fn get_duration_with_symphonia(path: &std::path::Path) -> i64 {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return 0,
-    };
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-    let hint = Hint::new();
-    let probed = match get_probe().format(&hint, mss, &Default::default(), &Default::default()) {
-        Ok(p) => p,
-        Err(_) => return 0,
-    };
-    let format = probed.format;
-    let track = match format.default_track() {
-        Some(t) => t,
-        None => return 0,
-    };
-    let tb = track.codec_params.time_base;
-    let dur = track.codec_params.n_frames;
-    if let (Some(tb), Some(dur)) = (tb, dur) {
-        tb.calc_time(dur).seconds as i64
-    } else {
-        0
+fn get_duration_with_lofty(path: &std::path::Path) -> i64 {
+    match lofty::read_from_path(path) {
+        Ok(tagged_file) => {
+            tagged_file.properties().duration().as_secs() as i64
+        }
+        Err(_) => 0,
     }
 }
 
