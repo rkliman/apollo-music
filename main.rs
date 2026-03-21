@@ -1,6 +1,7 @@
 use config as app_config;
 use lofty::file::TaggedFileExt;
 use lofty::prelude::ItemKey;
+use lofty::file::AudioFile;
 use clap::{Parser, Subcommand, ArgAction};
 use serde::Deserialize;
 use shellexpand;
@@ -11,7 +12,6 @@ use strsim;
 use colored::*;
 use fs_extra::dir::get_size;
 use human_bytes::human_bytes;
-use std::fs::File;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap; // Add this line
 use globset::{Glob, GlobSetBuilder}; // Add this import
