@@ -250,6 +250,17 @@ fn find_duplicates(db_path: &str, fix: bool) {
     let db_path = shellexpand::tilde(db_path).to_string();
     let conn = rusqlite::Connection::open(db_path).expect("Failed to open database");
 
+    // Create table to track duplicates the user wants to keep
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS kept_duplicates (
+            id INTEGER PRIMARY KEY,
+            artist TEXT NOT NULL,
+            title TEXT NOT NULL,
+            UNIQUE(artist, title)
+        )",
+        [],
+    ).expect("Failed to create kept_duplicates table");
+
     let mut stmt = conn.prepare(
         "SELECT artist, title, COUNT(*) as count FROM tracks \
          WHERE artist != '' AND title != '' \
@@ -264,7 +275,23 @@ fn find_duplicates(db_path: &str, fix: bool) {
         let artist: String = row.get(0).expect("Failed to get artist");
         let title: String = row.get(1).expect("Failed to get title");
         let count: i32 = row.get(2).expect("Failed to get count");
-        println!("{} {}", format!("{} - {}", artist, title).cyan(), format!(" ({} times)", count).yellow());
+
+        // Check if this duplicate is marked as "keep both"
+        let is_kept: bool = conn.query_row(
+            "SELECT 1 FROM kept_duplicates WHERE artist = ?1 AND title = ?2",
+            [&artist, &title],
+            |_| Ok(true)
+        ).unwrap_or(false);
+
+        if is_kept {
+            println!("{} {} {}",
+                format!("{} - {}", artist, title).cyan(),
+                format!(" ({} times)", count).yellow(),
+                "[KEEPING BOTH]".green()
+            );
+        } else {
+            println!("{} {}", format!("{} - {}", artist, title).cyan(), format!(" ({} times)", count).yellow());
+        }
 
         // Query for file paths of this duplicate track
         let mut path_stmt = conn.prepare(
@@ -280,15 +307,15 @@ fn find_duplicates(db_path: &str, fix: bool) {
             paths.push((id, path));
         }
 
-        if fix && paths.len() > 1 {
-            // Make "Skip" the first option
-            let mut options: Vec<String> = vec!["Skip".to_string()];
+        if fix && paths.len() > 1 && !is_kept {
+            // Make "Skip" and "Keep both" the first options
+            let mut options: Vec<String> = vec!["Skip".to_string(), "Keep both".to_string()];
             options.extend(paths.iter().map(|(_, p)| p.clone()));
             match inquire::Select::new(
                 &format!("Which file do you want to keep for '{} - {}'?", artist, title),
                 options.clone(),
             ).prompt() {
-                Ok(selected) if selected != "Skip" => {
+                Ok(selected) if selected != "Skip" && selected != "Keep both" => {
                     // Remove all except the selected one
                     for (id, path) in &paths {
                         if path != &selected {
@@ -302,6 +329,13 @@ fn find_duplicates(db_path: &str, fix: bool) {
                             }
                         }
                     }
+                }
+                Ok(selected) if selected == "Keep both" => {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO kept_duplicates (artist, title) VALUES (?1, ?2)",
+                        [&artist, &title],
+                    ).expect("Failed to save kept duplicate");
+                    println!("  Keeping all copies of '{} - {}' (won't show again)", artist, title);
                 }
                 Ok(_) | Err(_) => {
                     println!("  Skipped fixing '{} - {}'", artist, title);
