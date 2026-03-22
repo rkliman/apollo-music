@@ -283,15 +283,10 @@ fn find_duplicates(db_path: &str, fix: bool) {
             |_| Ok(true)
         ).unwrap_or(false);
 
-        if is_kept {
-            println!("{} {} {}",
-                format!("{} - {}", artist, title).cyan(),
-                format!(" ({} times)", count).yellow(),
-                "[KEEPING BOTH]".green()
-            );
-        } else {
-            println!("{} {}", format!("{} - {}", artist, title).cyan(), format!(" ({} times)", count).yellow());
-        }
+        let keep_tag = if is_kept { "[Keep All] ".green() } else {
+            "".green()
+        };
+        println!("{}{} {}", keep_tag, format!("{} - {}", artist, title).cyan(),format!("(x{})", count).yellow());
 
         // Query for file paths of this duplicate track
         let mut path_stmt = conn.prepare(
