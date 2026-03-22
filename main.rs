@@ -283,9 +283,7 @@ fn find_duplicates(db_path: &str, fix: bool) {
             |_| Ok(true)
         ).unwrap_or(false);
 
-        let keep_tag = if is_kept { "[Keep All] ".green() } else {
-            "".green()
-        };
+        let keep_tag = if is_kept { "[Keep All] ".green() } else { "".green() };
         println!("{}{} {}", keep_tag, format!("{} - {}", artist, title).cyan(),format!("(x{})", count).yellow());
 
         // Query for file paths of this duplicate track
