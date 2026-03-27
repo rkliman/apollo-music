@@ -8,7 +8,7 @@ use walkdir;
 use std::path::Path;
 use std::fs;
 use strsim;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use globset::{Glob, GlobSetBuilder};
 use rayon::prelude::*;
@@ -1159,20 +1159,42 @@ fn compress_tracks(
 
     let thread_count = jobs.unwrap_or_else(|| num_cpus::get());
     println!(
-        "Compressing {} tracks to {} as {} at {} bitrate (using {} threads)...",
+        "Compressing {} tracks to {} as {} at {} bitrate (using {} threads)...\n",
         paths.len(), output_dir, format, bitrate, thread_count
     );
 
-    let pb = Arc::new(ProgressBar::new(paths.len() as u64));
-    pb.set_style(
-        ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+    // Set up multi-progress display
+    let multi_progress = Arc::new(MultiProgress::new());
+
+    // Main progress bar
+    let main_pb = Arc::new(multi_progress.add(ProgressBar::new(paths.len() as u64)));
+    main_pb.set_style(
+        ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) - {msg}")
             .unwrap()
             .progress_chars("##-"),
     );
 
+    // Worker status bars (limit to 8 for cleaner display)
+    let worker_count = thread_count.min(8);
+    let worker_bars: Vec<_> = (0..worker_count)
+        .map(|i| {
+            let pb = multi_progress.add(ProgressBar::new_spinner());
+            pb.set_style(
+                ProgressStyle::with_template(&format!("  Worker {}: {{spinner}} {{msg}}", i + 1))
+                    .unwrap()
+            );
+            pb.set_message("Idle".to_string());
+            Arc::new(pb)
+        })
+        .collect();
+
     let compressed_count = Arc::new(Mutex::new(0));
     let skipped_count = Arc::new(Mutex::new(0));
     let failed_count = Arc::new(Mutex::new(0));
+
+    // Clone for the parallel closure
+    let main_pb_clone = Arc::clone(&main_pb);
+    let worker_bars_clone = worker_bars.clone();
 
     // Process files in parallel
     paths.par_iter().for_each(|source_path| {
@@ -1180,9 +1202,8 @@ fn compress_tracks(
 
         // Skip if source doesn't exist
         if !source.exists() {
-            pb.set_message(format!("Missing: {}", source_path));
             *failed_count.lock().unwrap() += 1;
-            pb.inc(1);
+            main_pb_clone.inc(1);
             return;
         }
 
@@ -1196,10 +1217,9 @@ fn compress_tracks(
 
         // Create parent directory if needed
         if let Some(parent) = output_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                pb.set_message(format!("Failed to create dir: {}", e));
+            if let Err(_) = std::fs::create_dir_all(parent) {
                 *failed_count.lock().unwrap() += 1;
-                pb.inc(1);
+                main_pb_clone.inc(1);
                 return;
             }
         }
@@ -1207,9 +1227,18 @@ fn compress_tracks(
         // Skip if output already exists (unless force is enabled)
         if !force && output_path.exists() {
             *skipped_count.lock().unwrap() += 1;
-            pb.inc(1);
+            main_pb_clone.inc(1);
             return;
         }
+
+        // Get the current thread's worker bar
+        let file_name = source.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let worker_idx = rayon::current_thread_index().unwrap_or(0) % worker_count;
+        let worker_bar = &worker_bars_clone[worker_idx];
+
+        // Update worker status
+        worker_bar.set_message(format!("🎵 {}", file_name));
+        worker_bar.tick();
 
         // Build ffmpeg command
         let mut cmd = std::process::Command::new("ffmpeg");
@@ -1245,16 +1274,32 @@ fn compress_tracks(
         match status {
             Ok(exit_status) if exit_status.success() => {
                 *compressed_count.lock().unwrap() += 1;
+                worker_bar.set_message(format!("✓ {}", file_name));
             }
             _ => {
                 *failed_count.lock().unwrap() += 1;
+                worker_bar.set_message(format!("✗ {}", file_name));
             }
         }
 
-        pb.inc(1);
+        main_pb_clone.inc(1);
+
+        // Update main progress bar message
+        let compressed = *compressed_count.lock().unwrap();
+        let skipped = *skipped_count.lock().unwrap();
+        let failed = *failed_count.lock().unwrap();
+        main_pb_clone.set_message(format!(
+            "✓ {} ⊘ {} ✗ {}",
+            compressed, skipped, failed
+        ));
     });
 
-    pb.finish_with_message("Compression complete");
+    main_pb.finish_with_message("Compression complete");
+
+    // Clear worker bars
+    for wb in &worker_bars {
+        wb.finish_and_clear();
+    }
 
     let compressed = *compressed_count.lock().unwrap();
     let skipped = *skipped_count.lock().unwrap();
