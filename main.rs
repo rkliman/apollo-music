@@ -4,18 +4,78 @@ use lofty::prelude::ItemKey;
 use lofty::file::AudioFile;
 use clap::{Parser, Subcommand, ArgAction};
 use serde::Deserialize;
-use shellexpand;
-use walkdir; // Add walkdir import
+use walkdir;
 use std::path::Path;
 use std::fs;
 use strsim;
-use colored::*;
-use fs_extra::dir::get_size;
-use human_bytes::human_bytes;
 use indicatif::{ProgressBar, ProgressStyle};
-use std::collections::HashMap; // Add this line
-use globset::{Glob, GlobSetBuilder}; // Add this import
+use std::collections::HashMap;
+use globset::{Glob, GlobSetBuilder};
+use rayon::prelude::*;
+use std::sync::{Arc, Mutex};
 
+// Helper functions to replace removed dependencies
+
+fn expand_tilde(path: &str) -> String {
+    if path.starts_with('~') {
+        if let Some(home) = std::env::var_os("HOME") {
+            return path.replacen('~', &home.to_string_lossy(), 1);
+        }
+    }
+    path.to_string()
+}
+
+fn format_bytes(bytes: f64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB", "PB"];
+    if bytes < 1024.0 {
+        return format!("{:.2} B", bytes);
+    }
+    let exp = (bytes.ln() / 1024_f64.ln()).floor() as usize;
+    let exp = exp.min(UNITS.len() - 1);
+    let value = bytes / 1024_f64.powi(exp as i32);
+    format!("{:.2} {}", value, UNITS[exp])
+}
+
+fn get_dir_size(path: &str) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    for entry in walkdir::WalkDir::new(path) {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            total += entry.metadata()?.len();
+        }
+    }
+    Ok(total)
+}
+
+// Simple ANSI color helpers
+trait Colorize {
+    fn red(&self) -> String;
+    fn green(&self) -> String;
+    fn yellow(&self) -> String;
+    fn cyan(&self) -> String;
+    fn bold(&self) -> String;
+    fn underline(&self) -> String;
+}
+
+impl Colorize for str {
+    fn red(&self) -> String { format!("\x1b[31m{}\x1b[0m", self) }
+    fn green(&self) -> String { format!("\x1b[32m{}\x1b[0m", self) }
+    fn yellow(&self) -> String { format!("\x1b[33m{}\x1b[0m", self) }
+    fn cyan(&self) -> String { format!("\x1b[36m{}\x1b[0m", self) }
+    fn bold(&self) -> String { format!("\x1b[1m{}\x1b[0m", self) }
+    fn underline(&self) -> String { format!("\x1b[4m{}\x1b[0m", self) }
+}
+
+fn write_csv_row<W: std::io::Write>(writer: &mut W, fields: &[&str]) -> std::io::Result<()> {
+    let escaped: Vec<String> = fields.iter().map(|f| {
+        if f.contains(',') || f.contains('"') || f.contains('\n') {
+            format!("\"{}\"", f.replace('"', "\"\""))
+        } else {
+            f.to_string()
+        }
+    }).collect();
+    writeln!(writer, "{}", escaped.join(","))
+}
 
 /// Search for a pattern in a file and display the lines that contain it.
 #[derive(Parser)]
@@ -60,6 +120,32 @@ enum Commands {
     },
     /// List all genres
     Genres,
+    /// Compress audio files to mp3 for mobile sync
+    Compress {
+        /// Output directory for compressed files
+        #[arg(long, short = 'o')]
+        output_dir: String,
+
+        /// Output format (mp3, aac, opus)
+        #[arg(long, default_value = "mp3")]
+        format: String,
+
+        /// Audio bitrate (e.g., 128k, 192k, 256k)
+        #[arg(long, default_value = "192k")]
+        bitrate: String,
+
+        /// Number of parallel jobs (default: number of CPU cores)
+        #[arg(long, short = 'j')]
+        jobs: Option<usize>,
+
+        /// Force reconversion even if file already exists
+        #[arg(long, action = ArgAction::SetTrue)]
+        force: bool,
+
+        /// Optional search query to filter tracks
+        #[arg()]
+        query: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,8 +183,8 @@ fn sanitize_filename_component(s: &str, replacements: &Option<HashMap<String, St
 }
 
 fn index_library(settings: &Settings, dry_run: bool) {
-    let music_dir = shellexpand::tilde(&settings.files.music_directory).to_string();
-    let db_path = shellexpand::tilde(&settings.files.database_name).to_string();
+    let music_dir = expand_tilde(&settings.files.music_directory);
+    let db_path = expand_tilde(&settings.files.database_name);
     let file_pattern = settings.files.file_pattern.as_deref();
 
     // Build ignore matcher
@@ -247,7 +333,7 @@ fn index_library(settings: &Settings, dry_run: bool) {
 }
 
 fn find_duplicates(db_path: &str, fix: bool) {
-    let db_path = shellexpand::tilde(db_path).to_string();
+    let db_path = expand_tilde(db_path);
     let conn = rusqlite::Connection::open(db_path).expect("Failed to open database");
 
     // Create table to track duplicates the user wants to keep
@@ -402,7 +488,7 @@ fn find_duplicates(db_path: &str, fix: bool) {
 }
 
 fn load_settings() -> Settings {
-    let config_path = shellexpand::tilde("~/.config/apollo-music/config.toml").to_string();
+    let config_path = expand_tilde("~/.config/apollo-music/config.toml");
     app_config::Config::builder()
         .add_source(app_config::File::with_name(&config_path))
         .add_source(app_config::Environment::with_prefix("APP"))
@@ -415,7 +501,7 @@ fn load_settings() -> Settings {
 fn index_playlists(music_dir: &str, db_path: &str) {
     // loads and indexes .m3u or .m3u8 playlists in the given directory and stores them in a database
     // create or open the database
-    let db_path = shellexpand::tilde(&db_path).to_string();
+    let db_path = expand_tilde(&db_path);
     let mut conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
     conn.execute(
         "CREATE TABLE IF NOT EXISTS playlists (
@@ -490,7 +576,6 @@ fn index_playlists(music_dir: &str, db_path: &str) {
                                 .unwrap_or_else(|| song_file_name.to_string());
                             println!("  Suggested song name: {}", song_name);
                             if !song_file_name.is_empty() {
-                                let db_path = shellexpand::tilde(&db_path).to_string();
                                 let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
                                 let mut stmt = conn.prepare("SELECT title, path FROM tracks").expect("Failed to prepare statement");
                                 let mut suggestions = Vec::new();
@@ -559,7 +644,7 @@ fn index_playlists(music_dir: &str, db_path: &str) {
 }
 
 fn search_db(db_path: &str, statement: &str, query: &str) -> Vec<(String, String, String)> {
-    let db_path = shellexpand::tilde(db_path).to_string();
+    let db_path = expand_tilde(db_path);
     let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
 
     let mut stmt = conn.prepare(statement).expect("Failed to prepare statement");
@@ -588,7 +673,7 @@ fn search_db(db_path: &str, statement: &str, query: &str) -> Vec<(String, String
 }
 
 fn search_tracks(db_path: &str, query: Option<String>) {
-    let db_path = shellexpand::tilde(db_path).to_string();
+    let db_path = expand_tilde(db_path);
 
     // Display Tracks (flat list for search)
     println!("{} {}", "Tracks".bold().underline(), "(Track - Album - Artist)");
@@ -664,7 +749,7 @@ fn print_grouped_tracks(results: Vec<(String, String, String)>) {
 }
 
 fn list_tracks(db_path: &str, query: Option<String>, genre: Option<String>) {
-    let db_path = shellexpand::tilde(db_path).to_string();
+    let db_path = expand_tilde(db_path);
     let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
 
     // Print genre header if filtering
@@ -757,7 +842,7 @@ fn list_tracks(db_path: &str, query: Option<String>, genre: Option<String>) {
 }
 
 fn export_tracks(db_path: &str) {
-    let db_path = shellexpand::tilde(db_path).to_string();
+    let db_path = expand_tilde(db_path);
     let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
 
     let mut stmt = conn.prepare("SELECT artist, album, title FROM tracks").expect("Failed to prepare statement");
@@ -766,25 +851,23 @@ fn export_tracks(db_path: &str) {
     // Write CSV to a file in the same directory as the database, named "tracks_export.csv"
     let db_folder = std::path::Path::new(&db_path).parent().unwrap_or_else(|| std::path::Path::new("."));
     let csv_path = db_folder.join("tracks_export.csv");
-    let file = std::fs::File::create(&csv_path).expect("Failed to create CSV file");
-    let mut wtr = csv::Writer::from_writer(file);
+    let mut file = std::fs::File::create(&csv_path).expect("Failed to create CSV file");
 
     // Write CSV header
-    wtr.write_record(&["Artist", "Album", "Title"]).expect("Failed to write CSV header");
+    write_csv_row(&mut file, &["Artist", "Album", "Title"]).expect("Failed to write CSV header");
 
     while let Some(row) = rows.next().expect("Failed to fetch row") {
         let artist: String = row.get(0).unwrap_or_default();
         let album: String = row.get(1).unwrap_or_default();
         let title: String = row.get(2).unwrap_or_default();
-        wtr.write_record(&[artist, album, title]).expect("Failed to write CSV record");
+        write_csv_row(&mut file, &[&artist, &album, &title]).expect("Failed to write CSV record");
     }
 
-    wtr.flush().expect("Failed to flush CSV writer");
     println!("Exported tracks to {}", csv_path.display());
 }
 
 fn get_stats(music_dir: &str, db_path: &str) {
-    let db_path = shellexpand::tilde(db_path).to_string();
+    let db_path = expand_tilde(db_path);
     let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
 
     let total_tracks: i64 = conn.query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get(0)).unwrap_or(0);
@@ -844,7 +927,7 @@ fn get_stats(music_dir: &str, db_path: &str) {
         }
     }
 
-    let folder_size: String = human_bytes(get_size(&music_dir).unwrap() as f64);
+    let folder_size: String = format_bytes(get_dir_size(&music_dir).unwrap() as f64);
 
 
 
@@ -973,7 +1056,7 @@ fn generate_path_from_pattern(
 }
 
 fn list_genres(db_path: &str) {
-    let db_path = shellexpand::tilde(db_path).to_string();
+    let db_path = expand_tilde(db_path);
     let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
 
     let mut stmt = conn.prepare(
@@ -1006,11 +1089,188 @@ fn list_genres(db_path: &str) {
     }
 }
 
+fn compress_tracks(
+    music_dir: &str,
+    db_path: &str,
+    output_dir: &str,
+    format: &str,
+    bitrate: &str,
+    jobs: Option<usize>,
+    force: bool,
+    query: Option<String>,
+) {
+    let db_path = expand_tilde(db_path);
+    let music_dir = expand_tilde(music_dir);
+    let output_dir = expand_tilde(output_dir);
+
+    // Check if ffmpeg is available
+    if std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_err()
+    {
+        eprintln!("{}", "Error: ffmpeg is not installed or not in PATH".red());
+        eprintln!("Please install ffmpeg to use the compress command");
+        return;
+    }
+
+    // Set up thread pool if jobs specified
+    if let Some(num_jobs) = jobs {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(num_jobs)
+            .build_global()
+            .ok();
+    }
+
+    let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
+
+    // Query tracks based on optional filter
+    let (query_sql, pattern) = if let Some(ref q) = query {
+        (
+            "SELECT path FROM tracks WHERE album LIKE ?1 OR artist LIKE ?1 OR title LIKE ?1",
+            Some(format!("%{}%", q))
+        )
+    } else {
+        ("SELECT path FROM tracks", None)
+    };
+
+    let mut stmt = conn.prepare(query_sql).expect("Failed to prepare statement");
+
+    let mut rows = if let Some(ref p) = pattern {
+        stmt.query([p]).expect("Failed to execute query")
+    } else {
+        stmt.query([]).expect("Failed to execute query")
+    };
+
+    let mut paths = Vec::new();
+    while let Some(row) = rows.next().expect("Failed to fetch row") {
+        let path: String = row.get(0).expect("Failed to get path");
+        paths.push(path);
+    }
+    drop(rows);
+    drop(stmt);
+
+    if paths.is_empty() {
+        println!("{}", "No tracks found to compress.".yellow());
+        return;
+    }
+
+    let thread_count = jobs.unwrap_or_else(|| num_cpus::get());
+    println!(
+        "Compressing {} tracks to {} as {} at {} bitrate (using {} threads)...",
+        paths.len(), output_dir, format, bitrate, thread_count
+    );
+
+    let pb = Arc::new(ProgressBar::new(paths.len() as u64));
+    pb.set_style(
+        ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+            .unwrap()
+            .progress_chars("##-"),
+    );
+
+    let compressed_count = Arc::new(Mutex::new(0));
+    let skipped_count = Arc::new(Mutex::new(0));
+    let failed_count = Arc::new(Mutex::new(0));
+
+    // Process files in parallel
+    paths.par_iter().for_each(|source_path| {
+        let source = std::path::Path::new(&source_path);
+
+        // Skip if source doesn't exist
+        if !source.exists() {
+            pb.set_message(format!("Missing: {}", source_path));
+            *failed_count.lock().unwrap() += 1;
+            pb.inc(1);
+            return;
+        }
+
+        // Calculate relative path from music_dir
+        let relative_path = source.strip_prefix(&music_dir).unwrap_or(source);
+
+        // Create output path with appropriate extension
+        let mut output_path = std::path::PathBuf::from(&output_dir);
+        output_path.push(relative_path);
+        output_path.set_extension(format);
+
+        // Create parent directory if needed
+        if let Some(parent) = output_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                pb.set_message(format!("Failed to create dir: {}", e));
+                *failed_count.lock().unwrap() += 1;
+                pb.inc(1);
+                return;
+            }
+        }
+
+        // Skip if output already exists (unless force is enabled)
+        if !force && output_path.exists() {
+            *skipped_count.lock().unwrap() += 1;
+            pb.inc(1);
+            return;
+        }
+
+        // Build ffmpeg command
+        let mut cmd = std::process::Command::new("ffmpeg");
+        cmd.arg("-i").arg(&source_path);
+
+        // Set codec and bitrate based on format
+        match format {
+            "mp3" => {
+                cmd.arg("-c:a").arg("libmp3lame");
+            }
+            "aac" | "m4a" => {
+                cmd.arg("-c:a").arg("aac");
+            }
+            "opus" => {
+                cmd.arg("-c:a").arg("libopus");
+            }
+            _ => {
+                cmd.arg("-c:a").arg("libmp3lame");
+            }
+        }
+
+        cmd.arg("-b:a")
+            .arg(bitrate)
+            .arg("-map")
+            .arg("a")
+            .arg("-y")
+            .arg(&output_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        let status = cmd.status();
+
+        match status {
+            Ok(exit_status) if exit_status.success() => {
+                *compressed_count.lock().unwrap() += 1;
+            }
+            _ => {
+                *failed_count.lock().unwrap() += 1;
+            }
+        }
+
+        pb.inc(1);
+    });
+
+    pb.finish_with_message("Compression complete");
+
+    let compressed = *compressed_count.lock().unwrap();
+    let skipped = *skipped_count.lock().unwrap();
+    let failed = *failed_count.lock().unwrap();
+
+    println!("\nSummary:");
+    println!("  Compressed: {}", compressed.to_string().green());
+    println!("  Skipped (already exist): {}", skipped.to_string().yellow());
+    println!("  Failed: {}", failed.to_string().red());
+}
+
 fn main() {
     let settings = load_settings();
 
-    let music_dir = shellexpand::tilde(&settings.files.music_directory).to_string();
-    let db_path = shellexpand::tilde(&settings.files.database_name).to_string();
+    let music_dir = expand_tilde(&settings.files.music_directory);
+    let db_path = expand_tilde(&settings.files.database_name);
 
     let db_folder = std::path::Path::new(&db_path).parent().unwrap();
     if !std::path::Path::new(&db_folder).exists() {
@@ -1040,6 +1300,9 @@ fn main() {
         }
         Commands::Genres => {
             list_genres(&db_path);
+        }
+        Commands::Compress { output_dir, format, bitrate, jobs, force, query } => {
+            compress_tracks(&music_dir, &db_path, &output_dir, &format, &bitrate, jobs, force, query);
         }
     }
 }
