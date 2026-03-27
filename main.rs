@@ -13,6 +13,9 @@ use std::collections::HashMap;
 use globset::{Glob, GlobSetBuilder};
 use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use std::thread;
 
 // Helper functions to replace removed dependencies
 
@@ -1192,6 +1195,22 @@ fn compress_tracks(
     let skipped_count = Arc::new(Mutex::new(0));
     let failed_count = Arc::new(Mutex::new(0));
 
+    // Start background ticker thread to keep timer updating smoothly
+    let ticker_running = Arc::new(AtomicBool::new(true));
+    let ticker_running_clone = Arc::clone(&ticker_running);
+    let main_pb_ticker = Arc::clone(&main_pb);
+    let worker_bars_ticker = worker_bars.clone();
+
+    let ticker_handle = thread::spawn(move || {
+        while ticker_running_clone.load(Ordering::Relaxed) {
+            main_pb_ticker.tick();
+            for wb in &worker_bars_ticker {
+                wb.tick();
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+
     // Clone for the parallel closure
     let main_pb_clone = Arc::clone(&main_pb);
     let worker_bars_clone = worker_bars.clone();
@@ -1295,6 +1314,10 @@ fn compress_tracks(
             compressed, skipped, failed
         ));
     });
+
+    // Stop the ticker thread
+    ticker_running.store(false, Ordering::Relaxed);
+    ticker_handle.join().ok();
 
     main_pb.finish_with_message("Compression complete");
 
