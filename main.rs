@@ -1263,7 +1263,9 @@ fn compress_tracks(
         cmd.arg("-b:a")
             .arg(bitrate)
             .arg("-map")
-            .arg("a")
+            .arg("0")  // Map all streams (audio + album art)
+            .arg("-c:v")
+            .arg("copy")  // Copy album art without re-encoding
             .arg("-y")
             .arg(&output_path)
             .stdout(std::process::Stdio::null())
