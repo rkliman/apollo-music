@@ -5,7 +5,7 @@ use lofty::file::AudioFile;
 use clap::{Parser, Subcommand, ArgAction};
 use serde::Deserialize;
 use walkdir;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::fs;
 use strsim;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -1092,6 +1092,108 @@ fn list_genres(db_path: &str) {
     }
 }
 
+fn export_playlists_for_compressed(
+    conn: &rusqlite::Connection,
+    music_dir: &str,
+    output_dir: &str,
+    format: &str,
+) {
+    // Query all playlists from the database
+    let mut stmt = match conn.prepare("SELECT name, path FROM playlists") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to query playlists: {}", e);
+            return;
+        }
+    };
+
+    let playlist_results: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+
+    if playlist_results.is_empty() {
+        println!("No playlists found.");
+        return;
+    }
+
+    println!("Found {} playlists to export", playlist_results.len());
+
+    for (name, playlist_path) in playlist_results {
+        // Read the original playlist
+        let content = match std::fs::read_to_string(&playlist_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Failed to read playlist '{}': {}", name, e);
+                continue;
+            }
+        };
+
+        let playlist_path_obj = Path::new(&playlist_path);
+        let playlist_dir = playlist_path_obj.parent().unwrap_or_else(|| Path::new(""));
+
+        // Process each line and update paths
+        let mut updated_lines = Vec::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+
+            // Keep comments and empty lines as-is
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                updated_lines.push(line.to_string());
+                continue;
+            }
+
+            // Resolve the path (handle relative and absolute paths)
+            let song_path = if Path::new(trimmed).is_absolute() {
+                PathBuf::from(trimmed)
+            } else {
+                playlist_dir.join(trimmed)
+            };
+
+            // Try to make it relative to music_dir to get the relative structure
+            let relative_to_music = match song_path.strip_prefix(music_dir) {
+                Ok(rel) => rel,
+                Err(_) => {
+                    // If the path isn't under music_dir, try to use the filename
+                    eprintln!(
+                        "Warning: Path '{}' in playlist '{}' is not under music directory, skipping",
+                        song_path.display(),
+                        name
+                    );
+                    updated_lines.push(line.to_string());
+                    continue;
+                }
+            };
+
+            // Build the new path in output_dir with the new extension
+            let mut new_path = PathBuf::from(output_dir);
+            new_path.push(relative_to_music);
+            new_path.set_extension(format);
+
+            // Make the path relative to the output_dir (where the playlist will be)
+            let new_path_str = new_path.to_string_lossy().to_string();
+            updated_lines.push(new_path_str);
+        }
+
+        // Write the updated playlist to output_dir
+        let output_playlist_path = PathBuf::from(output_dir).join(format!("{}.m3u", name));
+
+        // Create parent directory if needed
+        if let Some(parent) = output_playlist_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("Failed to create directory for playlist '{}': {}", name, e);
+                continue;
+            }
+        }
+
+        match std::fs::write(&output_playlist_path, updated_lines.join("\n") + "\n") {
+            Ok(_) => println!("  ✓ Exported playlist: {}", name),
+            Err(e) => eprintln!("  ✗ Failed to write playlist '{}': {}", name, e),
+        }
+    }
+}
+
 fn compress_tracks(
     music_dir: &str,
     db_path: &str,
@@ -1194,6 +1296,7 @@ fn compress_tracks(
     let compressed_count = Arc::new(Mutex::new(0));
     let skipped_count = Arc::new(Mutex::new(0));
     let failed_count = Arc::new(Mutex::new(0));
+    let failed_files = Arc::new(Mutex::new(Vec::new()));
 
     // Start background ticker thread to keep timer updating smoothly
     let ticker_running = Arc::new(AtomicBool::new(true));
@@ -1222,6 +1325,7 @@ fn compress_tracks(
         // Skip if source doesn't exist
         if !source.exists() {
             *failed_count.lock().unwrap() += 1;
+            failed_files.lock().unwrap().push(source_path.clone());
             main_pb_clone.inc(1);
             return;
         }
@@ -1238,6 +1342,7 @@ fn compress_tracks(
         if let Some(parent) = output_path.parent() {
             if let Err(_) = std::fs::create_dir_all(parent) {
                 *failed_count.lock().unwrap() += 1;
+                failed_files.lock().unwrap().push(source_path.clone());
                 main_pb_clone.inc(1);
                 return;
             }
@@ -1299,6 +1404,7 @@ fn compress_tracks(
             }
             _ => {
                 *failed_count.lock().unwrap() += 1;
+                failed_files.lock().unwrap().push(source_path.clone());
                 worker_bar.set_message(format!("✗ {}", file_name));
             }
         }
@@ -1329,11 +1435,23 @@ fn compress_tracks(
     let compressed = *compressed_count.lock().unwrap();
     let skipped = *skipped_count.lock().unwrap();
     let failed = *failed_count.lock().unwrap();
+    let failed_list = failed_files.lock().unwrap();
 
     println!("\nSummary:");
     println!("  Compressed: {}", compressed.to_string().green());
     println!("  Skipped (already exist): {}", skipped.to_string().yellow());
     println!("  Failed: {}", failed.to_string().red());
+
+    if !failed_list.is_empty() {
+        println!("\nFailed files:");
+        for path in failed_list.iter() {
+            println!("  {}", path.red());
+        }
+    }
+
+    // Export playlists with updated paths
+    println!("\nExporting playlists...");
+    export_playlists_for_compressed(&conn, &music_dir, &output_dir, format);
 }
 
 fn main() {
