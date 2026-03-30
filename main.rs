@@ -232,33 +232,29 @@ fn index_library(settings: &Settings, dry_run: bool) {
 
     let tx = conn.transaction().expect("Failed to start transaction");
 
-    let mut stmt = tx.prepare("SELECT path FROM tracks").expect("Failed to prepare select statement");
-    let mut rows = stmt.query([]).expect("Failed to query tracks");
-
-    let mut to_remove = Vec::new();
-    while let Some(row) = rows.next().expect("Failed to fetch row") {
-        let path: String = row.get(0).expect("Failed to get path");
-        if !std::path::Path::new(&path).exists() {
-            to_remove.push(path);
-        }
-    }
-    drop(rows);
-    drop(stmt);
-
-    for path in to_remove {
-        println!("Removing missing file from database: {}", path);
-        tx.execute("DELETE FROM tracks WHERE path = ?1", [&path]).ok();
-    }
-
     println!("Indexing music files in directory: {}", music_dir);
 
     // Collect all files first to know the total count
-    let pb = ProgressBar::new(entries.len() as u64);
+    let pb = Arc::new(ProgressBar::new(entries.len() as u64));
     pb.set_style(ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
         .unwrap()
         .progress_chars("##-"));
 
-    for entry in entries {
+    // Start background ticker thread to keep progress bar updating smoothly
+    let ticker_running = Arc::new(AtomicBool::new(true));
+    let ticker_running_clone = Arc::clone(&ticker_running);
+    let pb_ticker = Arc::clone(&pb);
+
+    let ticker_handle = thread::spawn(move || {
+        while ticker_running_clone.load(Ordering::Relaxed) {
+            pb_ticker.tick();
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+
+    // Process files in parallel to read metadata
+    let pb_clone = Arc::clone(&pb);
+    let tracks: Vec<_> = entries.par_iter().filter_map(|entry| {
         let path = entry.path();
         let (artist, album, albumartist, title, year, genre) = match lofty::read_from_path(path) {
             Ok(tagged_file) => {
@@ -274,7 +270,10 @@ fn index_library(settings: &Settings, dry_run: bool) {
                 let genre = tag.and_then(|t| t.get_string(&ItemKey::Genre)).unwrap_or("").to_string();
                 (artist, album, albumartist, title, year, genre)
             }
-            Err(_) => ("".to_string(), "".to_string(), "".to_string(), "".to_string(), 0, "".to_string()),
+            Err(_) => {
+                pb_clone.inc(1);
+                return None;
+            }
         };
 
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -290,7 +289,7 @@ fn index_library(settings: &Settings, dry_run: bool) {
                         &album,
                         &title,
                         ext,
-                        &settings.replace, // <-- Pass the replacements from settings
+                        &settings.replace,
                     );
                     let new_abs_path = std::path::Path::new(&music_dir).join(&new_rel_path);
                     if new_abs_path != path {
@@ -310,27 +309,70 @@ fn index_library(settings: &Settings, dry_run: bool) {
                     }
                 }
 
-                let result = tx.execute(
-                    "INSERT OR IGNORE INTO tracks (path, artist, albumartist, album, title, duration, year, genre) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    [
-                        &path_str as &dyn rusqlite::ToSql,
-                        &artist,
-                        &albumartist,
-                        &album,
-                        &title,
-                        &0.0 as &dyn rusqlite::ToSql,
-                        &year,
-                        &genre,
-                    ]
-                );
-                if let Ok(1) = result {
-                    pb.set_message(format!("Added: {}", path_str));
-                }
+                pb_clone.inc(1);
+                return Some((path_str, artist, albumartist, album, title, year, genre));
             }
         }
-        pb.inc(1);
+        pb_clone.inc(1);
+        None
+    }).collect();
+
+    // Stop the ticker thread
+    ticker_running.store(false, Ordering::Relaxed);
+    ticker_handle.join().ok();
+
+    pb.finish_with_message("Metadata reading complete");
+
+    // Batch insert all tracks into database
+    println!("Inserting {} tracks into database...", tracks.len());
+    let insert_pb = ProgressBar::new(tracks.len() as u64);
+    insert_pb.set_style(ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+        .unwrap()
+        .progress_chars("##-"));
+
+    for (path_str, artist, albumartist, album, title, year, genre) in tracks {
+        let result = tx.execute(
+            "INSERT OR IGNORE INTO tracks (path, artist, albumartist, album, title, duration, year, genre) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            [
+                &path_str as &dyn rusqlite::ToSql,
+                &artist,
+                &albumartist,
+                &album,
+                &title,
+                &0.0 as &dyn rusqlite::ToSql,
+                &year,
+                &genre,
+            ]
+        );
+        if let Ok(1) = result {
+            insert_pb.set_message(format!("Added: {}", path_str));
+        }
+        insert_pb.inc(1);
     }
-    pb.finish_with_message("Indexing complete");
+    insert_pb.finish_with_message("Database insertion complete");
+
+    // Clean up missing files from database
+    println!("Checking for missing files in database...");
+    let mut stmt = tx.prepare("SELECT path FROM tracks").expect("Failed to prepare select statement");
+    let mut rows = stmt.query([]).expect("Failed to query tracks");
+
+    let mut to_remove = Vec::new();
+    while let Some(row) = rows.next().expect("Failed to fetch row") {
+        let path: String = row.get(0).expect("Failed to get path");
+        if !std::path::Path::new(&path).exists() {
+            to_remove.push(path);
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    for path in &to_remove {
+        println!("Removing missing file from database: {}", path);
+        tx.execute("DELETE FROM tracks WHERE path = ?1", [path]).ok();
+    }
+    if !to_remove.is_empty() {
+        println!("Removed {} missing files from database", to_remove.len());
+    }
 
     tx.commit().expect("Failed to commit transaction");
 }
@@ -537,6 +579,22 @@ fn index_playlists(music_dir: &str, db_path: &str) {
     }
 
     println!("Indexing playlists in directory: {}", music_dir);
+
+    // Load all tracks once to avoid repeated database queries for missing file suggestions
+    // This significantly improves performance when dealing with playlists that have missing files
+    let all_tracks: Vec<(String, String)> = {
+        let tracks_conn = rusqlite::Connection::open(&db_path).expect("Failed to open database for tracks");
+        let mut stmt = tracks_conn.prepare("SELECT title, path FROM tracks").expect("Failed to prepare statement");
+        let mut rows = stmt.query([]).expect("Failed to execute query");
+        let mut tracks = Vec::new();
+        while let Some(row) = rows.next().expect("Failed to fetch row") {
+            let title: String = row.get(0).expect("Failed to get title");
+            let path: String = row.get(1).expect("Failed to get path");
+            tracks.push((title, path));
+        }
+        tracks
+    };
+
     for entry in walkdir::WalkDir::new(&music_dir)
         .into_iter()
         .filter_map(Result::ok)
@@ -579,15 +637,11 @@ fn index_playlists(music_dir: &str, db_path: &str) {
                                 .unwrap_or_else(|| song_file_name.to_string());
                             println!("  Suggested song name: {}", song_name);
                             if !song_file_name.is_empty() {
-                                let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
-                                let mut stmt = conn.prepare("SELECT title, path FROM tracks").expect("Failed to prepare statement");
+                                // Use cached tracks instead of opening a new connection
                                 let mut suggestions = Vec::new();
-                                let mut rows = stmt.query([]).expect("Failed to execute query");
-                                while let Some(row) = rows.next().expect("Failed to fetch row") {
-                                    let candidate_title: String = row.get(0).expect("Failed to get title");
-                                    let candidate_path: String = row.get(1).expect("Failed to get path");
-                                    let score = strsim::jaro(&candidate_title, &song_name);
-                                    suggestions.push((score, candidate_path));
+                                for (candidate_title, candidate_path) in &all_tracks {
+                                    let score = strsim::jaro(candidate_title, &song_name);
+                                    suggestions.push((score, candidate_path.clone()));
                                 }
                                 // Sort by descending similarity score and take top 5
                                 suggestions.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
