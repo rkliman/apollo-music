@@ -1221,7 +1221,7 @@ fn export_playlists_for_compressed(
             };
 
             // Build the new path in output_dir with the new extension
-            let mut new_path = PathBuf::from(output_dir);
+            let mut new_path = PathBuf::new();
             new_path.push(relative_to_music);
             new_path.set_extension(format);
 
