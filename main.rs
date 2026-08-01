@@ -18,6 +18,7 @@ use std::time::Duration;
 use std::thread;
 use lofty::config::WriteOptions;
 use lofty::tag::TagExt; // needed for insert_text / save_to_path — remove if already in scope
+use lofty::tag::ItemValue;
 
 // Helper functions to replace removed dependencies
 
@@ -164,6 +165,12 @@ enum Commands {
         /// Show which tracks would be updated without modifying any files
         #[arg(long, action = ArgAction::SetTrue)]
         dry_run: bool,
+    },
+    /// Show detailed info about a track
+    Info {
+        /// Search Query
+        #[arg(required = true)]
+        query: String,
     },
 }
 
@@ -1803,6 +1810,124 @@ fn add_lyrics(
     println!("  Failed: {}", failed.to_string().red());
 }
 
+fn get_info(db_path: &str, query: &str) {
+    let db_path = expand_tilde(db_path);
+    let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
+
+    let pattern = format!("%{}%", query);
+    let mut stmt = conn.prepare(
+        "SELECT artist, album, title, path FROM tracks \
+         WHERE artist LIKE ?1 OR album LIKE ?1 OR title LIKE ?1 \
+         ORDER BY artist, album, title LIMIT 25"
+    ).expect("Failed to prepare statement");
+
+    let mut rows = stmt.query([&pattern]).expect("Failed to execute query");
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().expect("Failed to fetch row") {
+        let artist: String = row.get(0).unwrap_or_default();
+        let album: String = row.get(1).unwrap_or_default();
+        let title: String = row.get(2).unwrap_or_default();
+        let path: String = row.get(3).unwrap_or_default();
+        results.push((artist, album, title, path));
+    }
+
+    if results.is_empty() {
+        println!("{}", "No matching tracks found.".yellow());
+        return;
+    }
+
+    let options: Vec<String> = results
+        .iter()
+        .map(|(artist, album, title, _)| format!("{} - {}  [{}]", artist, title, album))
+        .collect();
+
+    let selection = inquire::Select::new("Select a track to view info:", options.clone())
+        .prompt();
+
+    let selected_idx = match selection {
+        Ok(sel) => options.iter().position(|o| o == &sel),
+        Err(_) => None,
+    };
+
+    let Some(idx) = selected_idx else {
+        println!("{}", "No track selected.".yellow());
+        return;
+    };
+
+    let (_, _, _, path) = &results[idx];
+    print_track_info(path);
+}
+
+fn print_track_info(path_str: &str) {
+    let path = std::path::Path::new(path_str);
+    println!("\n{}", path_str.bold().underline());
+
+    if !path.exists() {
+        println!("{}", "File does not exist on disk.".red());
+        return;
+    }
+
+    let tagged_file = match lofty::read_from_path(path) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("{}", format!("Failed to read file tags: {}", e).red());
+            return;
+        }
+    };
+
+    println!("{} {:?}", "File type:".bold(), tagged_file.file_type());
+
+    let properties = tagged_file.properties();
+    println!("\n{}", "Audio properties:".bold().underline());
+    println!("  {:<20} {:?}", "Duration:", properties.duration());
+    if let Some(br) = properties.overall_bitrate() {
+        println!("  {:<20} {} kbps", "Overall bitrate:", br);
+    }
+    if let Some(br) = properties.audio_bitrate() {
+        println!("  {:<20} {} kbps", "Audio bitrate:", br);
+    }
+    if let Some(sr) = properties.sample_rate() {
+        println!("  {:<20} {} Hz", "Sample rate:", sr);
+    }
+    if let Some(bd) = properties.bit_depth() {
+        println!("  {:<20} {}", "Bit depth:", bd);
+    }
+    if let Some(ch) = properties.channels() {
+        println!("  {:<20} {}", "Channels:", ch);
+    }
+
+    match tagged_file.primary_tag() {
+        Some(tag) => {
+            println!("\n{}", "Tags:".bold().underline());
+            for item in tag.items() {
+                let key_str = format!("{:?}", item.key());
+                let value_str = match item.value() {
+                    lofty::tag::ItemValue::Text(s) => s.clone(),
+                    lofty::tag::ItemValue::Locator(s) => s.clone(),
+                    lofty::tag::ItemValue::Binary(b) => format!("<binary, {} bytes>", b.len()),
+                };
+                println!("  {:<25} {}", key_str.cyan(), value_str);
+            }
+
+            let pictures = tag.pictures();
+            if !pictures.is_empty() {
+                println!("\n{}", "Artwork:".bold().underline());
+                for pic in pictures {
+                    println!(
+                        "  {:?}  {:?}  ({} bytes)",
+                        pic.pic_type(),
+                        pic.mime_type(),
+                        pic.data().len()
+                    );
+                }
+            }
+        }
+        None => {
+            println!("\n{}", "No tags found on this file.".yellow());
+        }
+    }
+}
+
 fn main() {
     let settings = load_settings();
 
@@ -1843,6 +1968,9 @@ fn main() {
         }
         Commands::Lyrics { query, overwrite, dry_run } => {
             add_lyrics(&music_dir, &db_path, None, query, overwrite, dry_run);
+        }
+        Commands::Info { query } => {
+            get_info(&db_path, &query);
         }
     }
 }
