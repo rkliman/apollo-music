@@ -16,6 +16,9 @@ indicatif = "0.17.11"
 globset = "0.4"
 rayon = "1.10"
 num_cpus = "1.16"
+reqwest = { version = "0.13.4", features = ["json", "query", "native-tls"] }
+native-tls = "0.2.18"
+tokio = { version = "1.53.1", features = ["rt-multi-thread"] }
 
 [[bin]]
 name = "apollo"

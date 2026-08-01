@@ -16,6 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::thread;
+use lofty::config::WriteOptions;
+use lofty::tag::TagExt; // needed for insert_text / save_to_path — remove if already in scope
 
 // Helper functions to replace removed dependencies
 
@@ -148,6 +150,20 @@ enum Commands {
         /// Optional search query to filter tracks
         #[arg()]
         query: Option<String>,
+    },
+    // Add lyrics to library
+    /// Add lyrics to library
+    Lyrics {
+        #[arg()]
+        query: Option<String>,
+
+        /// Overwrite existing unsynced (plain) lyrics with synced lyrics
+        #[arg(long, action = ArgAction::SetTrue)]
+        overwrite: bool,
+
+        /// Show which tracks would be updated without modifying any files
+        #[arg(long, action = ArgAction::SetTrue)]
+        dry_run: bool,
     },
 }
 
@@ -1508,6 +1524,285 @@ fn compress_tracks(
     export_playlists_for_compressed(&conn, &music_dir, &output_dir, format);
 }
 
+use reqwest;
+
+#[derive(Deserialize, Debug)]
+struct LrcLibResult {
+    #[serde(rename = "trackName")]
+    track_name: String,
+    #[serde(rename = "artistName")]
+    artist_name: String,
+    #[serde(rename = "plainLyrics")]
+    plain_lyrics: Option<String>,
+    #[serde(rename = "syncedLyrics")]
+    synced_lyrics: Option<String>,
+}
+
+async fn fetch_lyrics(
+    client: &reqwest::Client,
+    artist: &str,
+    title: &str,
+    album: Option<&str>,
+    duration_secs: Option<u32>,
+) -> Result<Option<LrcLibResult>, reqwest::Error> {
+    let mut req = client
+        .get("https://lrclib.net/api/get")
+        .query(&[("artist_name", artist), ("track_name", title)]);
+
+    if let Some(a) = album {
+        req = req.query(&[("album_name", a)]);
+    }
+    if let Some(d) = duration_secs {
+        req = req.query(&[("duration", d.to_string())]);
+    }
+
+    let resp: reqwest::Response = req.send().await?;
+    if resp.status().is_success() {
+        Ok(Some(resp.json::<LrcLibResult>().await?))
+    } else {
+        let text = resp.text().await.unwrap_or_default();
+        eprintln!("error body: {}", text);
+        Ok(None) // fall back to a search endpoint or another source
+    }
+}
+
+fn is_synced_lyrics(s: &str) -> bool {
+    // LRC-style lines look like "[00:12.34]lyric text"
+    s.lines().any(|l| {
+        let l = l.trim();
+        l.starts_with('[')
+            && l[1..].chars().next().map_or(false, |c| c.is_ascii_digit())
+    })
+}
+
+struct LyricsCandidate {
+    path: String,
+    artist: String,
+    album: String,
+    title: String,
+    duration: i64,
+    has_lyrics: bool,
+    is_synced: bool,
+}
+
+fn add_lyrics(
+    music_dir: &str,
+    db_path: &str,
+    jobs: Option<usize>,
+    query: Option<String>,
+    overwrite: bool,
+    dry_run: bool,
+) {
+    let _music_dir = expand_tilde(music_dir);
+    let db_path = expand_tilde(db_path);
+    let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
+
+    let (query_sql, pattern) = if let Some(ref q) = query {
+        (
+            "SELECT path, artist, album, title, duration FROM tracks \
+             WHERE album LIKE ?1 OR artist LIKE ?1 OR title LIKE ?1",
+            Some(format!("%{}%", q)),
+        )
+    } else {
+        ("SELECT path, artist, album, title, duration FROM tracks", None)
+    };
+
+    let mut stmt = conn.prepare(query_sql).expect("Failed to prepare statement");
+    let mut rows = if let Some(ref p) = pattern {
+        stmt.query([p]).expect("Failed to execute query")
+    } else {
+        stmt.query([]).expect("Failed to execute query")
+    };
+
+    let mut raw_tracks = Vec::new();
+    while let Some(row) = rows.next().expect("Failed to fetch row") {
+        raw_tracks.push((
+            row.get::<_, String>(0).unwrap_or_default(),
+            row.get::<_, String>(1).unwrap_or_default(),
+            row.get::<_, String>(2).unwrap_or_default(),
+            row.get::<_, String>(3).unwrap_or_default(),
+            row.get::<_, i64>(4).unwrap_or_default(),
+        ));
+    }
+    drop(rows);
+    drop(stmt);
+
+    if raw_tracks.is_empty() {
+        println!("{}", "No tracks found.".yellow());
+        return;
+    }
+
+    // Inspect existing tags to figure out which tracks actually need work.
+    println!("Checking existing lyrics tags for {} tracks...", raw_tracks.len());
+    let mut candidates = Vec::new();
+    for (path, artist, album, title, duration) in raw_tracks {
+        let p = std::path::Path::new(&path);
+        if !p.exists() {
+            continue;
+        }
+
+        let (has_lyrics, is_synced) = match lofty::read_from_path(p) {
+            Ok(tagged_file) => {
+                if let Some(lyrics) = tagged_file
+                    .primary_tag()
+                    .and_then(|t| t.get_string(&ItemKey::Lyrics))
+                {
+                    (true, is_synced_lyrics(lyrics))
+                } else {
+                    (false, false)
+                }
+            }
+            Err(_) => (false, false),
+        };
+
+        // Needs update if: no lyrics at all, OR (has plain lyrics AND --overwrite was passed)
+        let needs_update = !has_lyrics || (has_lyrics && !is_synced && overwrite);
+
+        if needs_update {
+            candidates.push(LyricsCandidate {
+                path,
+                artist,
+                album,
+                title,
+                duration,
+                has_lyrics,
+                is_synced,
+            });
+        }
+    }
+
+    if candidates.is_empty() {
+        println!("{}", "No tracks need lyrics updates.".green());
+        return;
+    }
+
+    println!("\n{} tracks will be updated:", candidates.len());
+    for c in &candidates {
+        let reason = if !c.has_lyrics {
+            "missing lyrics".to_string()
+        } else if !c.is_synced {
+            "unsynced lyrics, will overwrite".to_string()
+        } else {
+            "".to_string()
+        };
+        println!("  {} - {} ({})", c.artist.cyan(), c.title, reason.yellow());
+    }
+
+    if dry_run {
+        println!(
+            "\n{}",
+            "[dry-run] No files were modified. Re-run without --dry-run to apply.".yellow()
+        );
+        return;
+    }
+
+    if let Some(num_jobs) = jobs {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(num_jobs)
+            .build_global()
+            .ok();
+    }
+
+    let pb = Arc::new(ProgressBar::new(candidates.len() as u64));
+    pb.set_style(
+        ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+            .unwrap()
+            .progress_chars("##-"),
+    );
+
+    let ticker_running = Arc::new(AtomicBool::new(true));
+    let ticker_running_clone = Arc::clone(&ticker_running);
+    let pb_ticker = Arc::clone(&pb);
+    let ticker_handle = thread::spawn(move || {
+        while ticker_running_clone.load(Ordering::Relaxed) {
+            pb_ticker.tick();
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+
+    let updated_count = Arc::new(Mutex::new(0usize));
+    let not_found_count = Arc::new(Mutex::new(0usize));
+    let failed_count = Arc::new(Mutex::new(0usize));
+
+    // reqwest needs an async runtime; we create one and block_on it from each
+    // rayon worker thread (safe — these worker threads are separate from the
+    // tokio runtime's own threads).
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+    let client = reqwest::Client::builder()
+            .user_agent("apollo-music/0.1 (https://github.com/rkliman/apollo-music)")
+            .build()
+            .expect("failed to build client");
+
+    candidates.par_iter().for_each(|c| {
+        let path = std::path::Path::new(&c.path);
+        let duration_secs = if c.duration > 0 { Some(c.duration as u32) } else { None };
+
+        let result = rt.block_on(fetch_lyrics(
+            &client,
+            &c.artist,
+            &c.title,
+            if c.album.is_empty() { None } else { Some(c.album.as_str()) },
+            duration_secs,
+        ));
+
+        match result {
+            Ok(Some(lrc)) => {
+                if let Some(synced) = lrc.synced_lyrics.filter(|s| !s.trim().is_empty()) {
+                    match lofty::read_from_path(path) {
+                        Ok(mut tagged_file) => {
+                            if let Some(tag) = tagged_file.primary_tag_mut() {
+                                tag.insert_text(ItemKey::Lyrics, synced);
+                                match tag.save_to_path(path, WriteOptions::default()) {
+                                    Ok(_) => {
+                                        pb.set_message(format!("✓ {}", c.title));
+                                        *updated_count.lock().unwrap() += 1;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Failed to write lyrics to {}: {}", path.display(), e);
+                                        *failed_count.lock().unwrap() += 1;
+                                    }
+                                }
+                            } else {
+                                *failed_count.lock().unwrap() += 1;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to read {}: {}", path.display(), e);
+                            *failed_count.lock().unwrap() += 1;
+                        }
+                    }
+                } else {
+                    // Found a match on lrclib, but no synced lyrics available for it.
+                    pb.set_message(format!("⊘ no synced lyrics: {}", c.title));
+                    *not_found_count.lock().unwrap() += 1;
+                }
+            }
+            Ok(None) => {
+                pb.set_message(format!("⊘ not found: {}", c.title));
+                *not_found_count.lock().unwrap() += 1;
+            }
+            Err(e) => {
+                eprintln!("Error fetching lyrics for '{}': {}", c.title, e);
+                *failed_count.lock().unwrap() += 1;
+            }
+        }
+        pb.inc(1);
+    });
+
+    ticker_running.store(false, Ordering::Relaxed);
+    ticker_handle.join().ok();
+    pb.finish_with_message("Lyrics update complete");
+
+    let updated = *updated_count.lock().unwrap();
+    let not_found = *not_found_count.lock().unwrap();
+    let failed = *failed_count.lock().unwrap();
+
+    println!("\nSummary:");
+    println!("  Updated: {}", updated.to_string().green());
+    println!("  No synced lyrics found: {}", not_found.to_string().yellow());
+    println!("  Failed: {}", failed.to_string().red());
+}
+
 fn main() {
     let settings = load_settings();
 
@@ -1545,6 +1840,9 @@ fn main() {
         }
         Commands::Compress { output_dir, format, bitrate, jobs, force, query } => {
             compress_tracks(&music_dir, &db_path, &output_dir, &format, &bitrate, jobs, force, query);
+        }
+        Commands::Lyrics { query, overwrite, dry_run } => {
+            add_lyrics(&music_dir, &db_path, None, query, overwrite, dry_run);
         }
     }
 }

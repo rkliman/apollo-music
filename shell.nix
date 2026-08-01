@@ -8,6 +8,7 @@ pkgs.mkShell {
     pkg-config
     ffmpeg
     sqlite
+    native-tls
   ];
 
   shellHook = ''
