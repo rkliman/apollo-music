@@ -18,7 +18,12 @@ use std::time::Duration;
 use std::thread;
 use lofty::config::WriteOptions;
 use lofty::tag::TagExt; // needed for insert_text / save_to_path — remove if already in scope
-use lofty::tag::ItemValue;
+
+use deunicode::deunicode;
+
+fn normalize_text(s: &str) -> String {
+    deunicode(s)
+}
 
 // Helper functions to replace removed dependencies
 
@@ -1555,6 +1560,7 @@ async fn fetch_lyrics(
     let mut req = client
         .get("https://lrclib.net/api/get")
         .query(&[("artist_name", artist), ("track_name", title)]);
+    // println!("Searching LRClib for {} - {}", artist, title);
 
     if let Some(a) = album {
         req = req.query(&[("album_name", a)]);
@@ -1565,10 +1571,11 @@ async fn fetch_lyrics(
 
     let resp: reqwest::Response = req.send().await?;
     if resp.status().is_success() {
+        // println!("Found song {} - {}", artist, title);
         Ok(Some(resp.json::<LrcLibResult>().await?))
     } else {
         let text = resp.text().await.unwrap_or_default();
-        eprintln!("error body: {}", text);
+        // eprintln!("error body: {}", text);
         Ok(None) // fall back to a search endpoint or another source
     }
 }
@@ -1580,6 +1587,52 @@ fn is_synced_lyrics(s: &str) -> bool {
         l.starts_with('[')
             && l[1..].chars().next().map_or(false, |c| c.is_ascii_digit())
     })
+}
+
+#[derive(Deserialize, Debug)]
+struct LrcLibSearchResult {
+    #[serde(rename = "trackName")]
+    track_name: String,
+    #[serde(rename = "artistName")]
+    artist_name: String,
+    #[serde(rename = "plainLyrics")]
+    plain_lyrics: Option<String>,
+    #[serde(rename = "syncedLyrics")]
+    synced_lyrics: Option<String>,
+}
+
+async fn search_lyrics(
+    client: &reqwest::Client,
+    artist: &str,
+    title: &str,
+) -> Result<Option<LrcLibSearchResult>, reqwest::Error> {
+    let resp = client
+        .get("https://lrclib.net/api/search")
+        .query(&[("artist_name", artist), ("track_name", title)])
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+
+    let results: Vec<LrcLibSearchResult> = resp.json().await?;
+    if results.is_empty() {
+        return Ok(None);
+    }
+
+    // Rank by combined similarity of artist + title to the query
+    let best = results.into_iter().max_by(|a, b| {
+        let a_synced = a.synced_lyrics.as_deref().map_or(false, |s| !s.trim().is_empty());
+        let b_synced = b.synced_lyrics.as_deref().map_or(false, |s| !s.trim().is_empty());
+        let score_a = strsim::jaro(&a.artist_name, artist) + strsim::jaro(&a.track_name, title);
+        let score_b = strsim::jaro(&b.artist_name, artist) + strsim::jaro(&b.track_name, title);
+        (a_synced, score_a)
+            .partial_cmp(&(b_synced, score_b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Ok(best)
 }
 
 struct LyricsCandidate {
@@ -1744,13 +1797,34 @@ fn add_lyrics(
         let path = std::path::Path::new(&c.path);
         let duration_secs = if c.duration > 0 { Some(c.duration as u32) } else { None };
 
-        let result = rt.block_on(fetch_lyrics(
+        let mut result = rt.block_on(fetch_lyrics(
             &client,
-            &c.artist,
-            &c.title,
+            &normalize_text(&c.artist),
+            &normalize_text(&c.title),
             if c.album.is_empty() { None } else { Some(c.album.as_str()) },
             duration_secs,
         ));
+
+        let needs_fallback = match &result {
+            Ok(None) => true,
+            Ok(Some(lrc)) => lrc.synced_lyrics.as_deref().map_or(true, |s| s.trim().is_empty()),
+            Err(_) => false,
+        };
+
+        if needs_fallback {
+            if let Ok(Some(found)) = rt.block_on(search_lyrics(
+                &client,
+                &normalize_text(&c.artist),
+                &normalize_text(&c.title),
+            )) {
+                result = Ok(Some(LrcLibResult {
+                    track_name: found.track_name,
+                    artist_name: found.artist_name,
+                    plain_lyrics: found.plain_lyrics,
+                    synced_lyrics: found.synced_lyrics,
+                }));
+            }
+        }
 
         match result {
             Ok(Some(lrc)) => {
@@ -1761,7 +1835,7 @@ fn add_lyrics(
                                 tag.insert_text(ItemKey::Lyrics, synced);
                                 match tag.save_to_path(path, WriteOptions::default()) {
                                     Ok(_) => {
-                                        pb.set_message(format!("✓ {}", c.title));
+                                        pb.set_message(format!("✓ tagged synced lyrics for {} - {}", c.artist, c.title));
                                         *updated_count.lock().unwrap() += 1;
                                     }
                                     Err(e) => {
@@ -1778,11 +1852,31 @@ fn add_lyrics(
                             *failed_count.lock().unwrap() += 1;
                         }
                     }
-                } else {
-                    // Found a match on lrclib, but no synced lyrics available for it.
-                    pb.set_message(format!("⊘ no synced lyrics: {}", c.title));
-                    *not_found_count.lock().unwrap() += 1;
-                }
+                } else if let Some(plain) = lrc.plain_lyrics.filter(|s| !s.trim().is_empty()) {
+                    match lofty::read_from_path(path) {
+                        Ok(mut tagged_file) => {
+                            if let Some(tag) = tagged_file.primary_tag_mut() {
+                                tag.insert_text(ItemKey::Lyrics, plain);
+                                match tag.save_to_path(path, WriteOptions::default()) {
+                                    Ok(_) => {
+                                        pb.set_message(format!("✓ tagged plain lyrics for {} - {}", c.artist, c.title));
+                                        *updated_count.lock().unwrap() += 1;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Failed to write lyrics to {}: {}", path.display(), e);
+                                        *failed_count.lock().unwrap() += 1;
+                                    }
+                                }
+                            } else {
+                                *failed_count.lock().unwrap() += 1;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to read {}: {}", path.display(), e);
+                            *failed_count.lock().unwrap() += 1;
+                        }
+                    }
+                } 
             }
             Ok(None) => {
                 pb.set_message(format!("⊘ not found: {}", c.title));
