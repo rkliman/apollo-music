@@ -4,10 +4,8 @@ use lofty::prelude::ItemKey;
 use lofty::file::AudioFile;
 use clap::{Parser, Subcommand, ArgAction};
 use serde::Deserialize;
-use walkdir;
 use std::path::{Path, PathBuf};
 use std::fs;
-use strsim;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use globset::{Glob, GlobSetBuilder};
@@ -18,7 +16,6 @@ use std::time::Duration;
 use std::thread;
 use lofty::config::WriteOptions;
 use lofty::tag::TagExt; // needed for insert_text / save_to_path — remove if already in scope
-use reqwest;
 
 use deunicode::deunicode;
 
@@ -630,7 +627,7 @@ fn load_settings() -> Settings {
 }
 
 fn index_playlists(music_dir: &str, db_path: &str) {
-    let db_path = expand_tilde(&db_path);
+    let db_path = expand_tilde(db_path);
     let mut conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
     conn.execute(
         "CREATE TABLE IF NOT EXISTS playlists (
@@ -665,7 +662,7 @@ fn index_playlists(music_dir: &str, db_path: &str) {
         tracks
     };
 
-    for entry in walkdir::WalkDir::new(&music_dir)
+    for entry in walkdir::WalkDir::new(music_dir)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
@@ -730,8 +727,7 @@ fn index_playlists(music_dir: &str, db_path: &str) {
                                         ).prompt() {
                                             Ok(selected) if selected != "Skip" && selected != "Remove" => {
                                                 let selected_path = selected
-                                                    .splitn(2, ')')
-                                                    .nth(1)
+                                                    .split_once(')').map(|x| x.1)
                                                     .map(|s| s.trim())
                                                     .unwrap_or(&selected);
                                                 println!("  Replacing '{}' with '{}'", song_path.display(), selected_path);
@@ -798,7 +794,7 @@ fn search_tracks(db_path: &str, query: Option<String>) {
 
     for (i, (heading, column, idx)) in sections.iter().enumerate() {
         if i == 0 {
-            println!("{} {}", "Tracks".bold().underline(), "(Track - Album - Artist)");
+            println!("{} (Track - Album - Artist)", "Tracks".bold().underline());
         } else {
             println!("\n{}", heading.bold().underline());
         }
@@ -940,7 +936,7 @@ fn get_stats(music_dir: &str, db_path: &str) {
             conn.execute("UPDATE tracks SET duration = ?1 WHERE id = ?2", [duration, id as f64]).expect("Failed to update duration");
         }
         bar.pb.inc(1);
-        bar.pb.set_message(format!("{}", path));
+        bar.pb.set_message(path.to_string());
     }
     bar.pb.finish_with_message("Duration update complete");
     drop(bar);
@@ -972,7 +968,7 @@ fn get_stats(music_dir: &str, db_path: &str) {
         }
     }
 
-    let folder_size: String = format_bytes(get_dir_size(&music_dir).unwrap() as f64);
+    let folder_size: String = format_bytes(get_dir_size(music_dir).unwrap() as f64);
 
     println!("Total tracks: {}", total_tracks);
     println!("Total artists: {}", total_artists);
@@ -1368,7 +1364,7 @@ fn compress_tracks(
         worker_bar.tick();
 
         let mut cmd = std::process::Command::new("ffmpeg");
-        cmd.arg("-i").arg(&source_path);
+        cmd.arg("-i").arg(source_path);
 
         match format {
             "mp3" => { cmd.arg("-c:a").arg("libmp3lame"); }
@@ -1490,7 +1486,7 @@ fn is_synced_lyrics(s: &str) -> bool {
     s.lines().any(|l| {
         let l = l.trim();
         l.starts_with('[')
-            && l[1..].chars().next().map_or(false, |c| c.is_ascii_digit())
+            && l[1..].chars().next().is_some_and(|c| c.is_ascii_digit())
     })
 }
 
@@ -1515,8 +1511,8 @@ async fn search_lyrics(
     }
 
     let best = results.into_iter().max_by(|a, b| {
-        let a_synced = a.synced_lyrics.as_deref().map_or(false, |s| !s.trim().is_empty());
-        let b_synced = b.synced_lyrics.as_deref().map_or(false, |s| !s.trim().is_empty());
+        let a_synced = a.synced_lyrics.as_deref().is_some_and(|s| !s.trim().is_empty());
+        let b_synced = b.synced_lyrics.as_deref().is_some_and(|s| !s.trim().is_empty());
         let score_a = strsim::jaro(&a.artist_name, artist) + strsim::jaro(&a.track_name, title);
         let score_b = strsim::jaro(&b.artist_name, artist) + strsim::jaro(&b.track_name, title);
         (a_synced, score_a)
@@ -1642,7 +1638,7 @@ fn add_lyrics(
             Err(_) => (false, false),
         };
 
-        let needs_update = !has_lyrics || (has_lyrics && !is_synced && overwrite);
+        let needs_update = !has_lyrics || !is_synced && overwrite;
 
         if needs_update {
             candidates.push(LyricsCandidate {
@@ -1719,7 +1715,7 @@ fn add_lyrics(
 
         let needs_fallback = match &result {
             Ok(None) => true,
-            Ok(Some(lrc)) => lrc.synced_lyrics.as_deref().map_or(true, |s| s.trim().is_empty()),
+            Ok(Some(lrc)) => lrc.synced_lyrics.as_deref().is_none_or(|s| s.trim().is_empty()),
             Err(_) => false,
         };
 
@@ -1899,7 +1895,7 @@ fn main() {
 
     let db_folder = std::path::Path::new(&db_path).parent().unwrap();
     if !std::path::Path::new(&db_folder).exists() {
-        fs::create_dir_all(&db_folder).expect("Failed to create music directory");
+        fs::create_dir_all(db_folder).expect("Failed to create music directory");
     }
 
     let args = Cli::parse();
