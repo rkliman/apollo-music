@@ -18,6 +18,7 @@ use std::time::Duration;
 use std::thread;
 use lofty::config::WriteOptions;
 use lofty::tag::TagExt; // needed for insert_text / save_to_path — remove if already in scope
+use reqwest;
 
 use deunicode::deunicode;
 
@@ -25,7 +26,9 @@ fn normalize_text(s: &str) -> String {
     deunicode(s)
 }
 
+// ---------------------------------------------------------------------
 // Helper functions to replace removed dependencies
+// ---------------------------------------------------------------------
 
 fn expand_tilde(path: &str) -> String {
     if path.starts_with('~') {
@@ -58,7 +61,16 @@ fn get_dir_size(path: &str) -> std::io::Result<u64> {
     Ok(total)
 }
 
-// Simple ANSI color helpers
+// ---------------------------------------------------------------------
+// ANSI color helpers (macro-generated instead of hand copy-pasted)
+// ---------------------------------------------------------------------
+
+macro_rules! color_fn {
+    ($name:ident, $code:literal) => {
+        fn $name(&self) -> String { format!("\x1b[{}m{}\x1b[0m", $code, self) }
+    };
+}
+
 trait Colorize {
     fn red(&self) -> String;
     fn green(&self) -> String;
@@ -69,12 +81,12 @@ trait Colorize {
 }
 
 impl Colorize for str {
-    fn red(&self) -> String { format!("\x1b[31m{}\x1b[0m", self) }
-    fn green(&self) -> String { format!("\x1b[32m{}\x1b[0m", self) }
-    fn yellow(&self) -> String { format!("\x1b[33m{}\x1b[0m", self) }
-    fn cyan(&self) -> String { format!("\x1b[36m{}\x1b[0m", self) }
-    fn bold(&self) -> String { format!("\x1b[1m{}\x1b[0m", self) }
-    fn underline(&self) -> String { format!("\x1b[4m{}\x1b[0m", self) }
+    color_fn!(red, "31");
+    color_fn!(green, "32");
+    color_fn!(yellow, "33");
+    color_fn!(cyan, "36");
+    color_fn!(bold, "1");
+    color_fn!(underline, "4");
 }
 
 fn write_csv_row<W: std::io::Write>(writer: &mut W, fields: &[&str]) -> std::io::Result<()> {
@@ -86,6 +98,99 @@ fn write_csv_row<W: std::io::Write>(writer: &mut W, fields: &[&str]) -> std::io:
         }
     }).collect();
     writeln!(writer, "{}", escaped.join(","))
+}
+
+// ---------------------------------------------------------------------
+// DB helpers — every command was hand-rolling expand_tilde + Connection::open
+// ---------------------------------------------------------------------
+
+fn open_db(db_path: &str) -> rusqlite::Connection {
+    let db_path = expand_tilde(db_path);
+    rusqlite::Connection::open(&db_path).expect("Failed to open database")
+}
+
+/// Runs `sql` with `params` and collects each row into a 3-string tuple.
+/// Covers the very common (artist, album, title)-shaped queries used all
+/// over the CLI (search, list, export, info, ...).
+fn query_triples(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> Vec<(String, String, String)> {
+    let mut stmt = conn.prepare(sql).expect("Failed to prepare statement");
+    stmt.query_map(params, |row| {
+        Ok((
+            row.get::<_, String>(0).unwrap_or_default(),
+            row.get::<_, String>(1).unwrap_or_default(),
+            row.get::<_, String>(2).unwrap_or_default(),
+        ))
+    })
+    .expect("Failed to execute query")
+    .filter_map(Result::ok)
+    .collect()
+}
+
+fn collect_existing_paths_column(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
+    let sql = format!("SELECT path FROM {}", table);
+    let mut stmt = conn.prepare(&sql).expect("Failed to prepare select statement");
+    let mut rows = stmt.query([]).expect("Failed to query rows");
+    let mut missing = Vec::new();
+    while let Some(row) = rows.next().expect("Failed to fetch row") {
+        let path: String = row.get(0).expect("Failed to get path");
+        if !std::path::Path::new(&path).exists() {
+            missing.push(path);
+        }
+    }
+    missing
+}
+
+// ---------------------------------------------------------------------
+// Progress bar + background ticker, wrapped so cleanup can't be forgotten
+// (previously duplicated 3x with manual AtomicBool + thread::spawn).
+// ---------------------------------------------------------------------
+
+fn bar_style() -> ProgressStyle {
+    ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+        .unwrap()
+        .progress_chars("##-")
+}
+
+struct TickingBar {
+    pb: Arc<ProgressBar>,
+    running: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl TickingBar {
+    fn new(len: u64) -> Self {
+        let pb = Arc::new(ProgressBar::new(len));
+        pb.set_style(bar_style());
+        Self::from_bar(pb)
+    }
+
+    /// Wrap an already-configured progress bar (used for the multi-progress
+    /// main bar in `compress_tracks`, whose style differs slightly).
+    fn from_bar(pb: Arc<ProgressBar>) -> Self {
+        let running = Arc::new(AtomicBool::new(true));
+        let running_clone = Arc::clone(&running);
+        let pb_clone = Arc::clone(&pb);
+        let handle = thread::spawn(move || {
+            while running_clone.load(Ordering::Relaxed) {
+                pb_clone.tick();
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+        Self { pb, running, handle: Some(handle) }
+    }
+}
+
+impl Drop for TickingBar {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            h.join().ok();
+        }
+    }
 }
 
 /// Search for a pattern in a file and display the lines that contain it.
@@ -157,7 +262,6 @@ enum Commands {
         #[arg()]
         query: Option<String>,
     },
-    // Add lyrics to library
     /// Add lyrics to library
     Lyrics {
         #[arg()]
@@ -184,7 +288,7 @@ struct FilesConfig {
     music_directory: String,
     database_name: String,
     file_pattern: Option<String>,
-    ignore: Option<Vec<String>>, // <-- Add this line
+    ignore: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -234,14 +338,12 @@ fn index_library(settings: &Settings, dry_run: bool) {
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
         .filter(|e| {
-            // Get the path relative to music_dir for matching
             let rel_path = e.path().strip_prefix(&music_dir).unwrap_or(e.path());
             !glob_set.is_match(rel_path)
         })
         .collect();
 
-    // create or open the database
-    let mut conn = rusqlite::Connection::open(db_path).expect("Failed to open database");
+    let mut conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS tracks (
@@ -262,26 +364,10 @@ fn index_library(settings: &Settings, dry_run: bool) {
 
     println!("Indexing music files in directory: {}", music_dir);
 
-    // Collect all files first to know the total count
-    let pb = Arc::new(ProgressBar::new(entries.len() as u64));
-    pb.set_style(ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-        .unwrap()
-        .progress_chars("##-"));
-
-    // Start background ticker thread to keep progress bar updating smoothly
-    let ticker_running = Arc::new(AtomicBool::new(true));
-    let ticker_running_clone = Arc::clone(&ticker_running);
-    let pb_ticker = Arc::clone(&pb);
-
-    let ticker_handle = thread::spawn(move || {
-        while ticker_running_clone.load(Ordering::Relaxed) {
-            pb_ticker.tick();
-            thread::sleep(Duration::from_millis(100));
-        }
-    });
+    let bar = TickingBar::new(entries.len() as u64);
+    let pb = Arc::clone(&bar.pb);
 
     // Process files in parallel to read metadata
-    let pb_clone = Arc::clone(&pb);
     let tracks: Vec<_> = entries.par_iter().filter_map(|entry| {
         let path = entry.path();
         let (artist, album, albumartist, title, year, genre) = match lofty::read_from_path(path) {
@@ -299,7 +385,7 @@ fn index_library(settings: &Settings, dry_run: bool) {
                 (artist, album, albumartist, title, year, genre)
             }
             Err(_) => {
-                pb_clone.inc(1);
+                pb.inc(1);
                 return None;
             }
         };
@@ -308,7 +394,6 @@ fn index_library(settings: &Settings, dry_run: bool) {
             if ext == "mp3" || ext == "flac" || ext == "wav" || ext == "m4a" {
                 let mut path_str = path.to_string_lossy().to_string();
 
-                // Move file if pattern is set
                 if let Some(pattern) = file_pattern {
                     let new_rel_path = generate_path_from_pattern(
                         pattern,
@@ -337,26 +422,19 @@ fn index_library(settings: &Settings, dry_run: bool) {
                     }
                 }
 
-                pb_clone.inc(1);
+                pb.inc(1);
                 return Some((path_str, artist, albumartist, album, title, year, genre));
             }
         }
-        pb_clone.inc(1);
+        pb.inc(1);
         None
     }).collect();
 
-    // Stop the ticker thread
-    ticker_running.store(false, Ordering::Relaxed);
-    ticker_handle.join().ok();
+    bar.pb.finish_with_message("Metadata reading complete");
+    drop(bar); // stop ticker before starting the next progress bar
 
-    pb.finish_with_message("Metadata reading complete");
-
-    // Batch insert all tracks into database
     println!("Inserting {} tracks into database...", tracks.len());
-    let insert_pb = ProgressBar::new(tracks.len() as u64);
-    insert_pb.set_style(ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-        .unwrap()
-        .progress_chars("##-"));
+    let insert_bar = TickingBar::new(tracks.len() as u64);
 
     for (path_str, artist, albumartist, album, title, year, genre) in tracks {
         let result = tx.execute(
@@ -373,26 +451,16 @@ fn index_library(settings: &Settings, dry_run: bool) {
             ]
         );
         if let Ok(1) = result {
-            insert_pb.set_message(format!("Added: {}", path_str));
+            insert_bar.pb.set_message(format!("Added: {}", path_str));
         }
-        insert_pb.inc(1);
+        insert_bar.pb.inc(1);
     }
-    insert_pb.finish_with_message("Database insertion complete");
+    insert_bar.pb.finish_with_message("Database insertion complete");
+    drop(insert_bar);
 
     // Clean up missing files from database
     println!("Checking for missing files in database...");
-    let mut stmt = tx.prepare("SELECT path FROM tracks").expect("Failed to prepare select statement");
-    let mut rows = stmt.query([]).expect("Failed to query tracks");
-
-    let mut to_remove = Vec::new();
-    while let Some(row) = rows.next().expect("Failed to fetch row") {
-        let path: String = row.get(0).expect("Failed to get path");
-        if !std::path::Path::new(&path).exists() {
-            to_remove.push(path);
-        }
-    }
-    drop(rows);
-    drop(stmt);
+    let to_remove = collect_existing_paths_column(&tx, "tracks");
 
     for path in &to_remove {
         println!("Removing missing file from database: {}", path);
@@ -406,10 +474,8 @@ fn index_library(settings: &Settings, dry_run: bool) {
 }
 
 fn find_duplicates(db_path: &str, fix: bool) {
-    let db_path = expand_tilde(db_path);
-    let conn = rusqlite::Connection::open(db_path).expect("Failed to open database");
+    let conn = open_db(db_path);
 
-    // Create table to track duplicates the user wants to keep
     conn.execute(
         "CREATE TABLE IF NOT EXISTS kept_duplicates (
             id INTEGER PRIMARY KEY,
@@ -435,7 +501,6 @@ fn find_duplicates(db_path: &str, fix: bool) {
         let title: String = row.get(1).expect("Failed to get title");
         let count: i32 = row.get(2).expect("Failed to get count");
 
-        // Check if this duplicate is marked as "keep both"
         let is_kept: bool = conn.query_row(
             "SELECT 1 FROM kept_duplicates WHERE artist = ?1 AND title = ?2",
             [&artist, &title],
@@ -445,7 +510,6 @@ fn find_duplicates(db_path: &str, fix: bool) {
         let keep_tag = if is_kept { "[Keep All] ".green() } else { "".green() };
         println!("{}{} {}", keep_tag, format!("{} - {}", artist, title).cyan(),format!("(x{})", count).yellow());
 
-        // Query for file paths of this duplicate track
         let mut path_stmt = conn.prepare(
             "SELECT id, path FROM tracks WHERE artist = ?1 AND title = ?2"
         ).expect("Failed to prepare path statement");
@@ -460,7 +524,6 @@ fn find_duplicates(db_path: &str, fix: bool) {
         }
 
         if fix && paths.len() > 1 && !is_kept {
-            // Make "Skip" and "Keep both" the first options
             let mut options: Vec<String> = vec!["Skip".to_string(), "Keep both".to_string()];
             options.extend(paths.iter().map(|(_, p)| p.clone()));
             match inquire::Select::new(
@@ -468,13 +531,10 @@ fn find_duplicates(db_path: &str, fix: bool) {
                 options.clone(),
             ).prompt() {
                 Ok(selected) if selected != "Skip" && selected != "Keep both" => {
-                    // Remove all except the selected one
                     for (id, path) in &paths {
                         if path != &selected {
-                            // Delete from database
                             conn.execute("DELETE FROM tracks WHERE id = ?1", [id]).expect("Failed to delete duplicate");
                             println!("  Removed duplicate from database: {}", path);
-                            // Delete from filesystem
                             match std::fs::remove_file(path) {
                                 Ok(_) => println!("  Deleted file from filesystem: {}", path),
                                 Err(e) => eprintln!("  Failed to delete file '{}': {}", path, e),
@@ -518,7 +578,6 @@ fn find_duplicates(db_path: &str, fix: bool) {
         let paths: String = row.get(2).expect("Failed to get paths");
         let files: Vec<&str> = paths.split(',').collect();
 
-        // Map extensions to quality rank (lower is better)
         fn quality_rank(ext: &str) -> u8 {
             match ext.to_lowercase().as_str() {
                 "flac" => 1,
@@ -539,7 +598,6 @@ fn find_duplicates(db_path: &str, fix: bool) {
 
         qualities.sort_by_key(|q| q.0);
 
-        // If there are at least two files and the best quality is not the only one
         if qualities.len() > 1 && qualities[0].0 < qualities[1].0 {
             found_quality_dupes = true;
             println!("{}", format!("{} - {}", artist, title).cyan());
@@ -572,8 +630,6 @@ fn load_settings() -> Settings {
 }
 
 fn index_playlists(music_dir: &str, db_path: &str) {
-    // loads and indexes .m3u or .m3u8 playlists in the given directory and stores them in a database
-    // create or open the database
     let db_path = expand_tilde(&db_path);
     let mut conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
     conn.execute(
@@ -587,20 +643,7 @@ fn index_playlists(music_dir: &str, db_path: &str) {
 
     let tx = conn.transaction().expect("Failed to start transaction");
 
-    // Remove playlists from the database that no longer exist on the filesystem
-    let mut stmt = tx.prepare("SELECT path FROM playlists").expect("Failed to prepare select statement");
-    let mut rows = stmt.query([]).expect("Failed to query playlists");
-
-    let mut to_remove = Vec::new();
-    while let Some(row) = rows.next().expect("Failed to fetch row") {
-        let path: String = row.get(0).expect("Failed to get path");
-        if !std::path::Path::new(&path).exists() {
-            to_remove.push(path);
-        }
-    }
-    drop(rows);
-    drop(stmt);
-
+    let to_remove = collect_existing_paths_column(&tx, "playlists");
     for path in to_remove {
         println!("Removing missing playlist from database: {}", path);
         tx.execute("DELETE FROM playlists WHERE path = ?1", [&path]).ok();
@@ -609,7 +652,6 @@ fn index_playlists(music_dir: &str, db_path: &str) {
     println!("Indexing playlists in directory: {}", music_dir);
 
     // Load all tracks once to avoid repeated database queries for missing file suggestions
-    // This significantly improves performance when dealing with playlists that have missing files
     let all_tracks: Vec<(String, String)> = {
         let tracks_conn = rusqlite::Connection::open(&db_path).expect("Failed to open database for tracks");
         let mut stmt = tracks_conn.prepare("SELECT title, path FROM tracks").expect("Failed to prepare statement");
@@ -638,7 +680,6 @@ fn index_playlists(music_dir: &str, db_path: &str) {
                     [&name as &dyn rusqlite::ToSql, &path_str]
                 ).ok();
 
-                // Check for missing files in the playlist
                 if let Ok(content) = std::fs::read_to_string(path) {
                     let playlist_dir = path.parent().unwrap_or_else(|| std::path::Path::new(""));
                     for line in content.lines() {
@@ -646,7 +687,6 @@ fn index_playlists(music_dir: &str, db_path: &str) {
                         if trimmed.is_empty() || trimmed.starts_with('#') {
                             continue;
                         }
-                        // Handle relative and absolute paths
                         let song_path = if std::path::Path::new(trimmed).is_absolute() {
                             std::path::PathBuf::from(trimmed)
                         } else {
@@ -659,19 +699,16 @@ fn index_playlists(music_dir: &str, db_path: &str) {
                                 song_path.display()
                             );
 
-                            // Suggest similar files in the music directory
                             let song_file_name = song_path.file_name().and_then(|f| f.to_str()).unwrap_or("");
                             let song_name = extract_song_name_from_filename(song_file_name)
                                 .unwrap_or_else(|| song_file_name.to_string());
                             println!("  Suggested song name: {}", song_name);
                             if !song_file_name.is_empty() {
-                                // Use cached tracks instead of opening a new connection
                                 let mut suggestions = Vec::new();
                                 for (candidate_title, candidate_path) in &all_tracks {
                                     let score = strsim::jaro(candidate_title, &song_name);
                                     suggestions.push((score, candidate_path.clone()));
                                 }
-                                // Sort by descending similarity score and take top 5
                                 suggestions.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
                                 let top_suggestions: Vec<_> = suggestions.into_iter().take(5).collect();
                                 if !top_suggestions.is_empty() {
@@ -682,20 +719,16 @@ fn index_playlists(music_dir: &str, db_path: &str) {
                                     options.push("Remove".to_string());
                                     options.push("Skip".to_string());
 
-                                    // Auto-replace if top suggestion is very similar
                                     let (top_score, top_path) = &top_suggestions[0];
                                     if *top_score >= 0.9 {
                                         println!("  Auto-replacing '{}' with '{}' (similarity {:.3})", song_path.display(), top_path, top_score);
                                         update_playlist_line(&path_str, &song_path.display().to_string(), top_path).expect("Failed to update playlist");
                                     } else {
-                                        // Use inquire to let user select a replacement or skip
                                         match inquire::Select::new(
                                             &format!("Select a replacement for '{}':", song_file_name),
                                             options.clone(),
                                         ).prompt() {
                                             Ok(selected) if selected != "Skip" && selected != "Remove" => {
-                                                // Extract the path from the selected option (before the space)
-                                                // Extract the path from the selected option: format is "(score) path"
                                                 let selected_path = selected
                                                     .splitn(2, ')')
                                                     .nth(1)
@@ -705,9 +738,7 @@ fn index_playlists(music_dir: &str, db_path: &str) {
                                                 update_playlist_line(&path_str, &song_path.display().to_string(), selected_path).expect("Failed to update playlist");
                                             }
                                             Ok(selected) if selected == "Remove" => {
-                                                // Remove the missing song from the playlist file
                                                 println!("  Removing '{}' from playlist", song_path.display());
-                                                // Use update_playlist_line with new_line as empty string to indicate removal
                                                 if let Err(e) = update_playlist_line(&path_str, &song_path.display().to_string(), "") {
                                                     eprintln!("Failed to update playlist file: {}", e);
                                                 }
@@ -728,88 +759,76 @@ fn index_playlists(music_dir: &str, db_path: &str) {
     tx.commit().expect("Failed to commit transaction");
 }
 
-fn search_db(db_path: &str, statement: &str, query: &str) -> Vec<(String, String, String)> {
-    let db_path = expand_tilde(db_path);
-    let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
-
-    let mut stmt = conn.prepare(statement).expect("Failed to prepare statement");
-
-    let mut results = Vec::new();
-    // Only pass a parameter if the statement contains ?1
-    if statement.contains("?1") {
-        let pattern = format!("%{}%", query);
-        let mut rows = stmt.query([&pattern]).expect("Failed to execute query");
-        while let Some(row) = rows.next().expect("Failed to fetch row") {
-            let artist: String = row.get(0).unwrap_or_default();
-            let album: String = row.get(1).unwrap_or_default();
-            let title: String = row.get(2).unwrap_or_default();
-            results.push((artist, album, title));
+/// (artist, album, title) rows filtered with a single LIKE pattern across
+/// `column`, or unfiltered if `pattern` is None.
+fn search_by_column(
+    conn: &rusqlite::Connection,
+    order_column: &str,
+    filter_column: &str,
+    pattern: Option<&str>,
+) -> Vec<(String, String, String)> {
+    match pattern {
+        Some(p) => {
+            let sql = format!(
+                "SELECT artist, album, title FROM tracks WHERE {} LIKE ?1 ORDER BY {}, artist, album, title",
+                filter_column, order_column
+            );
+            query_triples(conn, &sql, &[&format!("%{}%", p)])
         }
-    } else {
-        let mut rows = stmt.query([]).expect("Failed to execute query");
-        while let Some(row) = rows.next().expect("Failed to fetch row") {
-            let artist: String = row.get(0).unwrap_or_default();
-            let album: String = row.get(1).unwrap_or_default();
-            let title: String = row.get(2).unwrap_or_default();
-            results.push((artist, album, title));
+        None => {
+            let sql = format!(
+                "SELECT artist, album, title FROM tracks ORDER BY {}, artist, album, title",
+                order_column
+            );
+            query_triples(conn, &sql, &[])
         }
     }
-    results
 }
 
 fn search_tracks(db_path: &str, query: Option<String>) {
-    let db_path = expand_tilde(db_path);
+    let conn = open_db(db_path);
+    let q = query.as_deref();
 
-    // Display Tracks (flat list for search)
-    println!("{} {}", "Tracks".bold().underline(), "(Track - Album - Artist)");
-    let statement = "SELECT artist, album, title FROM tracks WHERE title LIKE ?1 ORDER BY artist, album, title";
-    let results = if let Some(ref q) = query {
-        search_db(&db_path, statement, q)
-    } else {
-        search_db(&db_path, statement, "")
-    };
-    if results.is_empty() {
-        println!("{}", "No tracks found.".yellow());
-    } else {
-        for (artist, album, title) in results {
-            println!("{} - {} - {}", title, album, artist);
+    // (section title, column to filter/order by, index into the triple used for dedup, label)
+    let sections: [(&str, &str, usize); 3] = [
+        ("Tracks", "title", 2),
+        ("Albums", "album", 1),
+        ("Artists", "artist", 0),
+    ];
+
+    for (i, (heading, column, idx)) in sections.iter().enumerate() {
+        if i == 0 {
+            println!("{} {}", "Tracks".bold().underline(), "(Track - Album - Artist)");
+        } else {
+            println!("\n{}", heading.bold().underline());
+        }
+
+        let results = search_by_column(&conn, column, column, q);
+
+        if results.is_empty() {
+            println!("{}", format!("No {} found.", heading.to_lowercase()).yellow());
+            continue;
+        }
+
+        if *idx == 2 {
+            // Tracks: flat list, title - album - artist
+            for (artist, album, title) in results {
+                println!("{} - {} - {}", title, album, artist);
+            }
+        } else {
+            // Albums / Artists: unique values only
+            let unique: std::collections::HashSet<String> = results
+                .into_iter()
+                .map(|t| match idx {
+                    1 => t.1, // album
+                    _ => t.0, // artist
+                })
+                .collect();
+            for v in unique {
+                println!("{}", v);
+            }
         }
     }
-    println!("");
-
-    println!("{}", "Albums".bold().underline());
-    let statement = "SELECT album, artist, title FROM tracks WHERE album LIKE ?1 ORDER BY album, artist, title";
-    let results = if let Some(ref q) = query {
-        search_db(&db_path, statement, q)
-    } else {
-        search_db(&db_path, statement, "")
-    };
-    if results.is_empty() {
-        println!("{}", "No albums found.".yellow());
-    } else {
-        let unique_albums = results.iter().map(|(album, _, _)| album).collect::<std::collections::HashSet<_>>();
-        for album in unique_albums {
-            println!("{}", album);
-        }
-    }
-    println!("");
-
-    println!("{}", "Artists".bold().underline());
-    let statement = "SELECT album, artist, title FROM tracks WHERE artist LIKE ?1 ORDER BY album, artist, title";
-    let results = if let Some(ref q) = query {
-        search_db(&db_path, statement, q)
-    } else {
-        search_db(&db_path, statement, "")
-    };
-    if results.is_empty() {
-        println!("{}", "No artists found.".yellow());
-    } else {
-        let unique_artists = results.iter().map(|(_, artist, _)| artist).collect::<std::collections::HashSet<_>>();
-        for artist in unique_artists {
-            println!("{}", artist);
-        }
-    }
-
 }
 
 fn print_grouped_tracks(results: Vec<(String, String, String)>) {
@@ -834,117 +853,60 @@ fn print_grouped_tracks(results: Vec<(String, String, String)>) {
 }
 
 fn list_tracks(db_path: &str, query: Option<String>, genre: Option<String>) {
-    let db_path = expand_tilde(db_path);
-    let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
+    let conn = open_db(db_path);
 
-    // Print genre header if filtering
     if let Some(ref g) = genre {
         println!("{} {}", "Genre:".bold(), g.cyan());
     }
 
-    let results: Vec<(String, String, String)> = match (&query, &genre) {
-        // No filters — list everything
-        (None, None) => {
-            let mut stmt = conn.prepare(
-                "SELECT artist, album, title FROM tracks ORDER BY artist, album, title"
-            ).expect("Failed to prepare statement");
-            let mut rows = stmt.query([]).expect("Failed to execute query");
-            let mut out = Vec::new();
-            while let Some(row) = rows.next().expect("Failed to fetch row") {
-                out.push((
-                    row.get(0).unwrap_or_default(),
-                    row.get(1).unwrap_or_default(),
-                    row.get(2).unwrap_or_default(),
-                ));
-            }
-            out
-        }
+    // Build the WHERE clause dynamically instead of a 4-way duplicated match.
+    let mut clauses: Vec<&str> = Vec::new();
+    let genre_pattern = genre.as_ref().map(|g| format!("%{}%", g));
+    let query_pattern = query.as_ref().map(|q| format!("%{}%", q));
 
-        // Genre only
-        (None, Some(g)) => {
-            let pattern = format!("%{}%", g);
-            let mut stmt = conn.prepare(
-                "SELECT artist, album, title FROM tracks \
-                 WHERE genre LIKE ?1 \
-                 ORDER BY artist, album, title"
-            ).expect("Failed to prepare statement");
-            let mut rows = stmt.query([&pattern]).expect("Failed to execute query");
-            let mut out = Vec::new();
-            while let Some(row) = rows.next().expect("Failed to fetch row") {
-                out.push((
-                    row.get(0).unwrap_or_default(),
-                    row.get(1).unwrap_or_default(),
-                    row.get(2).unwrap_or_default(),
-                ));
-            }
-            out
-        }
+    if genre_pattern.is_some() {
+        clauses.push("genre LIKE ?1");
+    }
+    if query_pattern.is_some() {
+        clauses.push(if genre_pattern.is_some() {
+            "(album LIKE ?2 OR artist LIKE ?2 OR title LIKE ?2)"
+        } else {
+            "(album LIKE ?1 OR artist LIKE ?1 OR title LIKE ?1)"
+        });
+    }
 
-        // Query only
-        (Some(q), None) => {
-            let pattern = format!("%{}%", q);
-            let mut stmt = conn.prepare(
-                "SELECT artist, album, title FROM tracks \
-                 WHERE album LIKE ?1 OR artist LIKE ?1 OR title LIKE ?1 \
-                 ORDER BY artist, album, title"
-            ).expect("Failed to prepare statement");
-            let mut rows = stmt.query([&pattern]).expect("Failed to execute query");
-            let mut out = Vec::new();
-            while let Some(row) = rows.next().expect("Failed to fetch row") {
-                out.push((
-                    row.get(0).unwrap_or_default(),
-                    row.get(1).unwrap_or_default(),
-                    row.get(2).unwrap_or_default(),
-                ));
-            }
-            out
-        }
+    let sql = if clauses.is_empty() {
+        "SELECT artist, album, title FROM tracks ORDER BY artist, album, title".to_string()
+    } else {
+        format!(
+            "SELECT artist, album, title FROM tracks WHERE {} ORDER BY artist, album, title",
+            clauses.join(" AND ")
+        )
+    };
 
-        // Both query and genre
-        (Some(q), Some(g)) => {
-            let q_pattern = format!("%{}%", q);
-            let g_pattern = format!("%{}%", g);
-            let mut stmt = conn.prepare(
-                "SELECT artist, album, title FROM tracks \
-                 WHERE genre LIKE ?1 \
-                 AND (album LIKE ?2 OR artist LIKE ?2 OR title LIKE ?2) \
-                 ORDER BY artist, album, title"
-            ).expect("Failed to prepare statement");
-            let mut rows = stmt.query([&g_pattern, &q_pattern]).expect("Failed to execute query");
-            let mut out = Vec::new();
-            while let Some(row) = rows.next().expect("Failed to fetch row") {
-                out.push((
-                    row.get(0).unwrap_or_default(),
-                    row.get(1).unwrap_or_default(),
-                    row.get(2).unwrap_or_default(),
-                ));
-            }
-            out
-        }
+    let results = match (&genre_pattern, &query_pattern) {
+        (Some(g), Some(q)) => query_triples(&conn, &sql, &[g, q]),
+        (Some(g), None) => query_triples(&conn, &sql, &[g]),
+        (None, Some(q)) => query_triples(&conn, &sql, &[q]),
+        (None, None) => query_triples(&conn, &sql, &[]),
     };
 
     print_grouped_tracks(results);
 }
 
 fn export_tracks(db_path: &str) {
-    let db_path = expand_tilde(db_path);
-    let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
+    let conn = open_db(db_path);
+    let expanded_db_path = expand_tilde(db_path);
 
-    let mut stmt = conn.prepare("SELECT artist, album, title FROM tracks").expect("Failed to prepare statement");
-    let mut rows = stmt.query([]).expect("Failed to execute query");
+    let results = query_triples(&conn, "SELECT artist, album, title FROM tracks", &[]);
 
-    // Write CSV to a file in the same directory as the database, named "tracks_export.csv"
-    let db_folder = std::path::Path::new(&db_path).parent().unwrap_or_else(|| std::path::Path::new("."));
+    let db_folder = std::path::Path::new(&expanded_db_path).parent().unwrap_or_else(|| std::path::Path::new("."));
     let csv_path = db_folder.join("tracks_export.csv");
     let mut file = std::fs::File::create(&csv_path).expect("Failed to create CSV file");
 
-    // Write CSV header
     write_csv_row(&mut file, &["Artist", "Album", "Title"]).expect("Failed to write CSV header");
 
-    while let Some(row) = rows.next().expect("Failed to fetch row") {
-        let artist: String = row.get(0).unwrap_or_default();
-        let album: String = row.get(1).unwrap_or_default();
-        let title: String = row.get(2).unwrap_or_default();
+    for (artist, album, title) in results {
         write_csv_row(&mut file, &[&artist, &album, &title]).expect("Failed to write CSV record");
     }
 
@@ -952,39 +914,37 @@ fn export_tracks(db_path: &str) {
 }
 
 fn get_stats(music_dir: &str, db_path: &str) {
-    let db_path = expand_tilde(db_path);
-    let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
+    let conn = open_db(db_path);
 
     let total_tracks: i64 = conn.query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get(0)).unwrap_or(0);
     let total_artists: i64 = conn.query_row("SELECT COUNT(DISTINCT artist) FROM tracks", [], |row| row.get(0)).unwrap_or(0);
     let total_albums: i64 = conn.query_row("SELECT COUNT(DISTINCT album) FROM tracks", [], |row| row.get(0)).unwrap_or(0);
-    
+
     // update durations if they are zero
     let mut stmt = conn.prepare("SELECT id, path, duration FROM tracks WHERE duration = 0").expect("Failed to prepare statement");
     let mut rows = stmt.query([]).expect("Failed to execute query");
-    // Collect all rows first to know the total count for the progress bar
     let mut rows_vec = Vec::new();
     while let Some(row) = rows.next().expect("Failed to fetch row") {
         let id: i64 = row.get(0).expect("Failed to get id");
         let path: String = row.get(1).expect("Failed to get path");
         rows_vec.push((id, path));
     }
+    drop(rows);
+    drop(stmt);
 
-    let pb = ProgressBar::new(rows_vec.len() as u64);
-    pb.set_style(ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-        .unwrap()
-        .progress_chars("##-"));
+    let bar = TickingBar::new(rows_vec.len() as u64);
 
     for (id, path) in rows_vec {
         let duration: f64 = get_duration_with_lofty(std::path::Path::new(&path)) as f64;
         if duration > 0.0 {
             conn.execute("UPDATE tracks SET duration = ?1 WHERE id = ?2", [duration, id as f64]).expect("Failed to update duration");
         }
-        pb.inc(1);
-        pb.set_message(format!("{}", path));
+        bar.pb.inc(1);
+        bar.pb.set_message(format!("{}", path));
     }
-    pb.finish_with_message("Duration update complete");
-    
+    bar.pb.finish_with_message("Duration update complete");
+    drop(bar);
+
     let total_duration: f64 = conn.query_row(
         "SELECT SUM(duration) FROM tracks",
         [],
@@ -1014,8 +974,6 @@ fn get_stats(music_dir: &str, db_path: &str) {
 
     let folder_size: String = format_bytes(get_dir_size(&music_dir).unwrap() as f64);
 
-
-
     println!("Total tracks: {}", total_tracks);
     println!("Total artists: {}", total_artists);
     println!("Total albums: {}", total_albums);
@@ -1029,7 +987,6 @@ fn get_stats(music_dir: &str, db_path: &str) {
     ).expect("Failed to prepare year histogram statement");
     let mut rows = stmt.query([]).expect("Failed to execute year histogram query");
 
-    // Collect year counts
     let mut year_counts = Vec::new();
     let mut max_count = 0;
     while let Some(row) = rows.next().expect("Failed to fetch year row") {
@@ -1041,7 +998,6 @@ fn get_stats(music_dir: &str, db_path: &str) {
         year_counts.push((year, count));
     }
 
-    // Print histogram
     for (year, count) in year_counts {
         let bar_len = if max_count > 0 { (count * 40 / max_count) as usize } else { 0 };
         let bar = "█".repeat(bar_len);
@@ -1059,30 +1015,22 @@ fn get_duration_with_lofty(path: &std::path::Path) -> i64 {
 }
 
 fn extract_song_name_from_filename(filename: &str) -> Option<String> {
-    // Remove extension
     let file_stem = std::path::Path::new(filename)
         .file_stem()
         .and_then(|s| s.to_str())?;
-    // Split on " - " and take the second part as song name
-    let parts1: Vec<&str> = file_stem.split(" - ").collect();
-    let parts2: Vec<&str> = file_stem.split(" － ").collect();
-    if parts1.len() > 1 {
-        return Some(parts1[1].to_string());
+    for sep in [" - ", " － "] {
+        let parts: Vec<&str> = file_stem.split(sep).collect();
+        if parts.len() > 1 {
+            return Some(parts[1].to_string());
+        }
     }
-    else if parts2.len() > 1 {
-        return Some(parts2[1].to_string());
-        
-    }
-    else {
-        return None;
-    }
+    None
 }
 
 fn update_playlist_line(playlist_path: &str, target_line: &str, new_line: &str) -> std::io::Result<()> {
     let content = std::fs::read_to_string(playlist_path)?;
     let playlist_dir = Path::new(playlist_path).parent().unwrap_or_else(|| Path::new(""));
 
-    // Convert target_line and new_line to relative paths (if possible)
     let target_path = Path::new(target_line);
     let target_rel = target_path.strip_prefix(playlist_dir).unwrap_or(target_path);
 
@@ -1122,7 +1070,6 @@ fn generate_path_from_pattern(
     replacements: &Option<HashMap<String, String>>,
 ) -> String {
     let artist_sanitized = sanitize_filename_component(artist, replacements);
-    // Use artist as albumartist if albumartist is empty or "Various Artists", otherwise use albumartist
     let albumartist_sanitized = if albumartist.trim().is_empty() || albumartist.trim().eq_ignore_ascii_case("Various Artists") {
         sanitize_filename_component(artist, replacements)
     } else {
@@ -1141,8 +1088,7 @@ fn generate_path_from_pattern(
 }
 
 fn list_genres(db_path: &str) {
-    let db_path = expand_tilde(db_path);
-    let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
+    let conn = open_db(db_path);
 
     let mut stmt = conn.prepare(
         "SELECT genre FROM tracks WHERE genre != ''"
@@ -1180,7 +1126,6 @@ fn export_playlists_for_compressed(
     output_dir: &str,
     format: &str,
 ) {
-    // Query all playlists from the database
     let mut stmt = match conn.prepare("SELECT name, path FROM playlists") {
         Ok(s) => s,
         Err(e) => {
@@ -1203,7 +1148,6 @@ fn export_playlists_for_compressed(
     println!("Found {} playlists to export", playlist_results.len());
 
     for (name, playlist_path) in playlist_results {
-        // Read the original playlist
         let content = match std::fs::read_to_string(&playlist_path) {
             Ok(c) => c,
             Err(e) => {
@@ -1215,29 +1159,24 @@ fn export_playlists_for_compressed(
         let playlist_path_obj = Path::new(&playlist_path);
         let playlist_dir = playlist_path_obj.parent().unwrap_or_else(|| Path::new(""));
 
-        // Process each line and update paths
         let mut updated_lines = Vec::new();
         for line in content.lines() {
             let trimmed = line.trim();
 
-            // Keep comments and empty lines as-is
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 updated_lines.push(line.to_string());
                 continue;
             }
 
-            // Resolve the path (handle relative and absolute paths)
             let song_path = if Path::new(trimmed).is_absolute() {
                 PathBuf::from(trimmed)
             } else {
                 playlist_dir.join(trimmed)
             };
 
-            // Try to make it relative to music_dir to get the relative structure
             let relative_to_music = match song_path.strip_prefix(music_dir) {
                 Ok(rel) => rel,
                 Err(_) => {
-                    // If the path isn't under music_dir, try to use the filename
                     eprintln!(
                         "Warning: Path '{}' in playlist '{}' is not under music directory, skipping",
                         song_path.display(),
@@ -1248,20 +1187,16 @@ fn export_playlists_for_compressed(
                 }
             };
 
-            // Build the new path in output_dir with the new extension
             let mut new_path = PathBuf::new();
             new_path.push(relative_to_music);
             new_path.set_extension(format);
 
-            // Make the path relative to the output_dir (where the playlist will be)
             let new_path_str = new_path.to_string_lossy().to_string();
             updated_lines.push(new_path_str);
         }
 
-        // Write the updated playlist to output_dir
         let output_playlist_path = PathBuf::from(output_dir).join(format!("{}.m3u", name));
 
-        // Create parent directory if needed
         if let Some(parent) = output_playlist_path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 eprintln!("Failed to create directory for playlist '{}': {}", name, e);
@@ -1286,11 +1221,10 @@ fn compress_tracks(
     force: bool,
     query: Option<String>,
 ) {
-    let db_path = expand_tilde(db_path);
+    let db_path_expanded = expand_tilde(db_path);
     let music_dir = expand_tilde(music_dir);
     let output_dir = expand_tilde(output_dir);
 
-    // Check if ffmpeg is available
     if std::process::Command::new("ffmpeg")
         .arg("-version")
         .stdout(std::process::Stdio::null())
@@ -1303,7 +1237,6 @@ fn compress_tracks(
         return;
     }
 
-    // Set up thread pool if jobs specified
     if let Some(num_jobs) = jobs {
         rayon::ThreadPoolBuilder::new()
             .num_threads(num_jobs)
@@ -1311,10 +1244,9 @@ fn compress_tracks(
             .ok();
     }
 
-    let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
+    let conn = rusqlite::Connection::open(&db_path_expanded).expect("Failed to open database");
 
-    // Query tracks based on optional filter
-    let (query_sql, pattern) = if let Some(ref q) = query {
+    let (query_sql, pattern): (&str, Option<String>) = if let Some(ref q) = query {
         (
             "SELECT path FROM tracks WHERE album LIKE ?1 OR artist LIKE ?1 OR title LIKE ?1",
             Some(format!("%{}%", q))
@@ -1324,19 +1256,18 @@ fn compress_tracks(
     };
 
     let mut stmt = conn.prepare(query_sql).expect("Failed to prepare statement");
-
-    let mut rows = if let Some(ref p) = pattern {
-        stmt.query([p]).expect("Failed to execute query")
-    } else {
-        stmt.query([]).expect("Failed to execute query")
+    let paths: Vec<String> = match &pattern {
+        Some(p) => stmt
+            .query_map([p], |row| row.get::<_, String>(0))
+            .expect("Failed to execute query")
+            .filter_map(Result::ok)
+            .collect(),
+        None => stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("Failed to execute query")
+            .filter_map(Result::ok)
+            .collect(),
     };
-
-    let mut paths = Vec::new();
-    while let Some(row) = rows.next().expect("Failed to fetch row") {
-        let path: String = row.get(0).expect("Failed to get path");
-        paths.push(path);
-    }
-    drop(rows);
     drop(stmt);
 
     if paths.is_empty() {
@@ -1353,15 +1284,13 @@ fn compress_tracks(
     // Set up multi-progress display
     let multi_progress = Arc::new(MultiProgress::new());
 
-    // Main progress bar
-    let main_pb = Arc::new(multi_progress.add(ProgressBar::new(paths.len() as u64)));
-    main_pb.set_style(
+    let main_pb_raw = Arc::new(multi_progress.add(ProgressBar::new(paths.len() as u64)));
+    main_pb_raw.set_style(
         ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) - {msg}")
             .unwrap()
             .progress_chars("##-"),
     );
 
-    // Worker status bars (limit to 8 for cleaner display)
     let worker_count = thread_count.min(8);
     let worker_bars: Vec<_> = (0..worker_count)
         .map(|i| {
@@ -1380,31 +1309,29 @@ fn compress_tracks(
     let failed_count = Arc::new(Mutex::new(0));
     let failed_files = Arc::new(Mutex::new(Vec::new()));
 
-    // Start background ticker thread to keep timer updating smoothly
-    let ticker_running = Arc::new(AtomicBool::new(true));
-    let ticker_running_clone = Arc::clone(&ticker_running);
-    let main_pb_ticker = Arc::clone(&main_pb);
+    // The worker spinners also need ticking; ride along on the same ticker
+    // thread as the main bar instead of a bespoke loop.
     let worker_bars_ticker = worker_bars.clone();
-
-    let ticker_handle = thread::spawn(move || {
-        while ticker_running_clone.load(Ordering::Relaxed) {
-            main_pb_ticker.tick();
-            for wb in &worker_bars_ticker {
-                wb.tick();
+    let bar = TickingBar::from_bar(Arc::clone(&main_pb_raw));
+    let ticker_running_for_workers = Arc::clone(&bar.running);
+    let worker_ticker_handle = {
+        let running = Arc::clone(&ticker_running_for_workers);
+        thread::spawn(move || {
+            while running.load(Ordering::Relaxed) {
+                for wb in &worker_bars_ticker {
+                    wb.tick();
+                }
+                thread::sleep(Duration::from_millis(100));
             }
-            thread::sleep(Duration::from_millis(100));
-        }
-    });
+        })
+    };
 
-    // Clone for the parallel closure
-    let main_pb_clone = Arc::clone(&main_pb);
+    let main_pb_clone = Arc::clone(&main_pb_raw);
     let worker_bars_clone = worker_bars.clone();
 
-    // Process files in parallel
     paths.par_iter().for_each(|source_path| {
         let source = std::path::Path::new(&source_path);
 
-        // Skip if source doesn't exist
         if !source.exists() {
             *failed_count.lock().unwrap() += 1;
             failed_files.lock().unwrap().push(source_path.clone());
@@ -1412,15 +1339,12 @@ fn compress_tracks(
             return;
         }
 
-        // Calculate relative path from music_dir
         let relative_path = source.strip_prefix(&music_dir).unwrap_or(source);
 
-        // Create output path with appropriate extension
         let mut output_path = std::path::PathBuf::from(&output_dir);
         output_path.push(relative_path);
         output_path.set_extension(format);
 
-        // Create parent directory if needed
         if let Some(parent) = output_path.parent() {
             if let Err(_) = std::fs::create_dir_all(parent) {
                 *failed_count.lock().unwrap() += 1;
@@ -1430,48 +1354,35 @@ fn compress_tracks(
             }
         }
 
-        // Skip if output already exists (unless force is enabled)
         if !force && output_path.exists() {
             *skipped_count.lock().unwrap() += 1;
             main_pb_clone.inc(1);
             return;
         }
 
-        // Get the current thread's worker bar
         let file_name = source.file_name().unwrap_or_default().to_string_lossy().to_string();
         let worker_idx = rayon::current_thread_index().unwrap_or(0) % worker_count;
         let worker_bar = &worker_bars_clone[worker_idx];
 
-        // Update worker status
         worker_bar.set_message(format!("🎵 {}", file_name));
         worker_bar.tick();
 
-        // Build ffmpeg command
         let mut cmd = std::process::Command::new("ffmpeg");
         cmd.arg("-i").arg(&source_path);
 
-        // Set codec and bitrate based on format
         match format {
-            "mp3" => {
-                cmd.arg("-c:a").arg("libmp3lame");
-            }
-            "aac" | "m4a" => {
-                cmd.arg("-c:a").arg("aac");
-            }
-            "opus" => {
-                cmd.arg("-c:a").arg("libopus");
-            }
-            _ => {
-                cmd.arg("-c:a").arg("libmp3lame");
-            }
+            "mp3" => { cmd.arg("-c:a").arg("libmp3lame"); }
+            "aac" | "m4a" => { cmd.arg("-c:a").arg("aac"); }
+            "opus" => { cmd.arg("-c:a").arg("libopus"); }
+            _ => { cmd.arg("-c:a").arg("libmp3lame"); }
         }
 
         cmd.arg("-b:a")
             .arg(bitrate)
             .arg("-map")
-            .arg("0")  // Map all streams (audio + album art)
+            .arg("0")
             .arg("-c:v")
-            .arg("copy")  // Copy album art without re-encoding
+            .arg("copy")
             .arg("-y")
             .arg(&output_path)
             .stdout(std::process::Stdio::null())
@@ -1493,7 +1404,6 @@ fn compress_tracks(
 
         main_pb_clone.inc(1);
 
-        // Update main progress bar message
         let compressed = *compressed_count.lock().unwrap();
         let skipped = *skipped_count.lock().unwrap();
         let failed = *failed_count.lock().unwrap();
@@ -1503,13 +1413,12 @@ fn compress_tracks(
         ));
     });
 
-    // Stop the ticker thread
-    ticker_running.store(false, Ordering::Relaxed);
-    ticker_handle.join().ok();
+    drop(bar); // stops main ticker; shared flag also signals the worker ticker below
+    let _ = &ticker_running_for_workers; // kept alive until here for clarity
+    worker_ticker_handle.join().ok();
 
-    main_pb.finish_with_message("Compression complete");
+    main_pb_raw.finish_with_message("Compression complete");
 
-    // Clear worker bars
     for wb in &worker_bars {
         wb.finish_and_clear();
     }
@@ -1531,13 +1440,12 @@ fn compress_tracks(
         }
     }
 
-    // Export playlists with updated paths
     println!("\nExporting playlists...");
     export_playlists_for_compressed(&conn, &music_dir, &output_dir, format);
 }
 
-use reqwest;
-
+// `fetch_lyrics`'s direct-lookup and `search_lyrics`'s fuzzy-search results
+// had identical shapes (LrcLibResult / LrcLibSearchResult) — merged into one.
 #[derive(Deserialize, Debug)]
 struct LrcLibResult {
     #[serde(rename = "trackName")]
@@ -1560,7 +1468,6 @@ async fn fetch_lyrics(
     let mut req = client
         .get("https://lrclib.net/api/get")
         .query(&[("artist_name", artist), ("track_name", title)]);
-    // println!("Searching LRClib for {} - {}", artist, title);
 
     if let Some(a) = album {
         req = req.query(&[("album_name", a)]);
@@ -1571,11 +1478,9 @@ async fn fetch_lyrics(
 
     let resp: reqwest::Response = req.send().await?;
     if resp.status().is_success() {
-        // println!("Found song {} - {}", artist, title);
         Ok(Some(resp.json::<LrcLibResult>().await?))
     } else {
-        let text = resp.text().await.unwrap_or_default();
-        // eprintln!("error body: {}", text);
+        let _text = resp.text().await.unwrap_or_default();
         Ok(None) // fall back to a search endpoint or another source
     }
 }
@@ -1589,23 +1494,11 @@ fn is_synced_lyrics(s: &str) -> bool {
     })
 }
 
-#[derive(Deserialize, Debug)]
-struct LrcLibSearchResult {
-    #[serde(rename = "trackName")]
-    track_name: String,
-    #[serde(rename = "artistName")]
-    artist_name: String,
-    #[serde(rename = "plainLyrics")]
-    plain_lyrics: Option<String>,
-    #[serde(rename = "syncedLyrics")]
-    synced_lyrics: Option<String>,
-}
-
 async fn search_lyrics(
     client: &reqwest::Client,
     artist: &str,
     title: &str,
-) -> Result<Option<LrcLibSearchResult>, reqwest::Error> {
+) -> Result<Option<LrcLibResult>, reqwest::Error> {
     let resp = client
         .get("https://lrclib.net/api/search")
         .query(&[("artist_name", artist), ("track_name", title)])
@@ -1616,12 +1509,11 @@ async fn search_lyrics(
         return Ok(None);
     }
 
-    let results: Vec<LrcLibSearchResult> = resp.json().await?;
+    let results: Vec<LrcLibResult> = resp.json().await?;
     if results.is_empty() {
         return Ok(None);
     }
 
-    // Rank by combined similarity of artist + title to the query
     let best = results.into_iter().max_by(|a, b| {
         let a_synced = a.synced_lyrics.as_deref().map_or(false, |s| !s.trim().is_empty());
         let b_synced = b.synced_lyrics.as_deref().map_or(false, |s| !s.trim().is_empty());
@@ -1645,6 +1537,43 @@ struct LyricsCandidate {
     is_synced: bool,
 }
 
+/// Writes `lyrics` into the file's Lyrics tag and saves it, reporting
+/// success/failure via the shared progress bar. Used for both the
+/// synced- and plain-lyrics cases, which previously duplicated this
+/// entire read/insert/save/report sequence.
+fn write_lyrics_tag(
+    path: &std::path::Path,
+    lyrics: String,
+    artist: &str,
+    title: &str,
+    pb: &ProgressBar,
+    kind: &str,
+) -> bool {
+    match lofty::read_from_path(path) {
+        Ok(mut tagged_file) => {
+            if let Some(tag) = tagged_file.primary_tag_mut() {
+                tag.insert_text(ItemKey::Lyrics, lyrics);
+                match tag.save_to_path(path, WriteOptions::default()) {
+                    Ok(_) => {
+                        pb.set_message(format!("✓ tagged {} lyrics for {} - {}", kind, artist, title));
+                        true
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to write lyrics to {}: {}", path.display(), e);
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to read {}: {}", path.display(), e);
+            false
+        }
+    }
+}
+
 fn add_lyrics(
     music_dir: &str,
     db_path: &str,
@@ -1654,8 +1583,7 @@ fn add_lyrics(
     dry_run: bool,
 ) {
     let _music_dir = expand_tilde(music_dir);
-    let db_path = expand_tilde(db_path);
-    let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
+    let conn = open_db(db_path);
 
     let (query_sql, pattern) = if let Some(ref q) = query {
         (
@@ -1692,7 +1620,6 @@ fn add_lyrics(
         return;
     }
 
-    // Inspect existing tags to figure out which tracks actually need work.
     println!("Checking existing lyrics tags for {} tracks...", raw_tracks.len());
     let mut candidates = Vec::new();
     for (path, artist, album, title, duration) in raw_tracks {
@@ -1715,7 +1642,6 @@ fn add_lyrics(
             Err(_) => (false, false),
         };
 
-        // Needs update if: no lyrics at all, OR (has plain lyrics AND --overwrite was passed)
         let needs_update = !has_lyrics || (has_lyrics && !is_synced && overwrite);
 
         if needs_update {
@@ -1763,22 +1689,7 @@ fn add_lyrics(
             .ok();
     }
 
-    let pb = Arc::new(ProgressBar::new(candidates.len() as u64));
-    pb.set_style(
-        ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-            .unwrap()
-            .progress_chars("##-"),
-    );
-
-    let ticker_running = Arc::new(AtomicBool::new(true));
-    let ticker_running_clone = Arc::clone(&ticker_running);
-    let pb_ticker = Arc::clone(&pb);
-    let ticker_handle = thread::spawn(move || {
-        while ticker_running_clone.load(Ordering::Relaxed) {
-            pb_ticker.tick();
-            thread::sleep(Duration::from_millis(100));
-        }
-    });
+    let bar = TickingBar::new(candidates.len() as u64);
 
     let updated_count = Arc::new(Mutex::new(0usize));
     let not_found_count = Arc::new(Mutex::new(0usize));
@@ -1793,6 +1704,7 @@ fn add_lyrics(
             .build()
             .expect("failed to build client");
 
+    let pb = Arc::clone(&bar.pb);
     candidates.par_iter().for_each(|c| {
         let path = std::path::Path::new(&c.path);
         let duration_secs = if c.duration > 0 { Some(c.duration as u32) } else { None };
@@ -1817,66 +1729,25 @@ fn add_lyrics(
                 &normalize_text(&c.artist),
                 &normalize_text(&c.title),
             )) {
-                result = Ok(Some(LrcLibResult {
-                    track_name: found.track_name,
-                    artist_name: found.artist_name,
-                    plain_lyrics: found.plain_lyrics,
-                    synced_lyrics: found.synced_lyrics,
-                }));
+                result = Ok(Some(found));
             }
         }
 
         match result {
             Ok(Some(lrc)) => {
                 if let Some(synced) = lrc.synced_lyrics.filter(|s| !s.trim().is_empty()) {
-                    match lofty::read_from_path(path) {
-                        Ok(mut tagged_file) => {
-                            if let Some(tag) = tagged_file.primary_tag_mut() {
-                                tag.insert_text(ItemKey::Lyrics, synced);
-                                match tag.save_to_path(path, WriteOptions::default()) {
-                                    Ok(_) => {
-                                        pb.set_message(format!("✓ tagged synced lyrics for {} - {}", c.artist, c.title));
-                                        *updated_count.lock().unwrap() += 1;
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Failed to write lyrics to {}: {}", path.display(), e);
-                                        *failed_count.lock().unwrap() += 1;
-                                    }
-                                }
-                            } else {
-                                *failed_count.lock().unwrap() += 1;
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to read {}: {}", path.display(), e);
-                            *failed_count.lock().unwrap() += 1;
-                        }
+                    if write_lyrics_tag(path, synced, &c.artist, &c.title, &pb, "synced") {
+                        *updated_count.lock().unwrap() += 1;
+                    } else {
+                        *failed_count.lock().unwrap() += 1;
                     }
                 } else if let Some(plain) = lrc.plain_lyrics.filter(|s| !s.trim().is_empty()) {
-                    match lofty::read_from_path(path) {
-                        Ok(mut tagged_file) => {
-                            if let Some(tag) = tagged_file.primary_tag_mut() {
-                                tag.insert_text(ItemKey::Lyrics, plain);
-                                match tag.save_to_path(path, WriteOptions::default()) {
-                                    Ok(_) => {
-                                        pb.set_message(format!("✓ tagged plain lyrics for {} - {}", c.artist, c.title));
-                                        *updated_count.lock().unwrap() += 1;
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Failed to write lyrics to {}: {}", path.display(), e);
-                                        *failed_count.lock().unwrap() += 1;
-                                    }
-                                }
-                            } else {
-                                *failed_count.lock().unwrap() += 1;
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to read {}: {}", path.display(), e);
-                            *failed_count.lock().unwrap() += 1;
-                        }
+                    if write_lyrics_tag(path, plain, &c.artist, &c.title, &pb, "plain") {
+                        *updated_count.lock().unwrap() += 1;
+                    } else {
+                        *failed_count.lock().unwrap() += 1;
                     }
-                } 
+                }
             }
             Ok(None) => {
                 pb.set_message(format!("⊘ not found: {}", c.title));
@@ -1890,9 +1761,8 @@ fn add_lyrics(
         pb.inc(1);
     });
 
-    ticker_running.store(false, Ordering::Relaxed);
-    ticker_handle.join().ok();
-    pb.finish_with_message("Lyrics update complete");
+    bar.pb.finish_with_message("Lyrics update complete");
+    drop(bar);
 
     let updated = *updated_count.lock().unwrap();
     let not_found = *not_found_count.lock().unwrap();
@@ -1905,8 +1775,7 @@ fn add_lyrics(
 }
 
 fn get_info(db_path: &str, query: &str) {
-    let db_path = expand_tilde(db_path);
-    let conn = rusqlite::Connection::open(&db_path).expect("Failed to open database");
+    let conn = open_db(db_path);
 
     let pattern = format!("%{}%", query);
     let mut stmt = conn.prepare(
