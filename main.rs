@@ -646,9 +646,13 @@ fn find_duplicates(db_path: &str, fix: bool) {
 }
 
 fn load_settings() -> Settings {
-    if !Path::new(&expand_tilde(CONFIG_PATH)).exists() {
+    let config_path = Path::new(&expand_tilde(CONFIG_PATH));
+    if !config_path.exists() {
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent).expect("Failed to create config directory");
+        }
         let toml_string = toml::to_string_pretty(&Settings::default()).unwrap();
-        fs::write(expand_tilde(CONFIG_PATH), toml_string).unwrap();
+        fs::write(config_path, toml_string).expect("Failed to write default config");
     }
     app_config::Config::builder()
         .add_source(app_config::File::with_name(&expand_tilde(CONFIG_PATH)))
