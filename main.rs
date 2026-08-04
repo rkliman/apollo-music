@@ -1421,6 +1421,8 @@ fn compress_tracks(
 
         match status {
             Ok(exit_status) if exit_status.success() => {
+                // Copy Lyrics tag
+                copy_lyrics_tag(&output_path);
                 *compressed_count.lock().unwrap() += 1;
                 worker_bar.set_message(format!("✓ {}", file_name));
             }
@@ -1471,6 +1473,18 @@ fn compress_tracks(
 
     println!("\nExporting playlists...");
     export_playlists_for_compressed(&conn, &music_dir, &output_dir, format);
+}
+
+fn copy_lyrics_tag(path: &Path) {
+    let Ok(mut tagged_file) = lofty::read_from_path(path) else { return; };
+    let Some(tag) = tagged_file.primary_tag_mut() else { return; };
+    let Some((key, lyrics)) = tag
+        .items()
+        .find(|i| matches!(i.key(), ItemKey::Unknown(k) if k.to_lowercase().starts_with("lyrics")))
+            .and_then(|i| Some((i.key().clone(), i.value().text()?.to_string()))) else {return;};
+    tag.remove_key(&key);
+    tag.insert_text(ItemKey::Lyrics, lyrics);
+    let _ = tag.save_to_path(path, WriteOptions::default());
 }
 
 // `fetch_lyrics`'s direct-lookup and `search_lyrics`'s fuzzy-search results
