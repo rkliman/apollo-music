@@ -16,7 +16,6 @@ use std::time::Duration;
 use std::thread;
 use lofty::config::WriteOptions;
 use lofty::tag::TagExt; // needed for insert_text / save_to_path — remove if already in scope
-use toml;
 
 use deunicode::deunicode;
 
