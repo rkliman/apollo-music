@@ -646,7 +646,8 @@ fn find_duplicates(db_path: &str, fix: bool) {
 }
 
 fn load_settings() -> Settings {
-    let config_path = Path::new(&expand_tilde(CONFIG_PATH));
+    let binding = expand_tilde(CONFIG_PATH);
+    let config_path = Path::new(&binding);
     if !config_path.exists() {
         if let Some(parent) = config_path.parent() {
             fs::create_dir_all(parent).expect("Failed to create config directory");
