@@ -1922,14 +1922,45 @@ fn print_track_info(path_str: &str) {
 }
 
 fn main() {
+    // (1) Load settings. creates config file if missing
     let settings = load_settings();
 
     let music_dir = expand_tilde(&settings.files.music_directory);
     let db_path = expand_tilde(&settings.files.database_name);
 
-    let db_folder = std::path::Path::new(&db_path).parent().unwrap();
-    if !std::path::Path::new(&db_folder).exists() {
-        fs::create_dir_all(db_folder).expect("Failed to create music directory");
+    // (2) Ensure the music directory exists
+    if !Path::new(&music_dir).exists() {
+        fs::create_dir_all(&music_dir).expect("Failed to create music directory");
+        println!("Created music directory: {}", music_dir);
+    }
+
+    // Ensure the database's parent directory exists
+    let db_folder = Path::new(&db_path)
+        .parent()
+        .expect("Database path has no parent directory");
+    if !db_folder.exists() {
+        fs::create_dir_all(db_folder).expect("Failed to create database directory");
+    }
+
+    // (3) Ensure the database file exists
+    if !Path::new(&db_path).exists() {
+        let conn = rusqlite::Connection::open(&db_path)
+            .expect("Failed to create database file");
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS tracks (
+                id INTEGER PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE,
+                artist TEXT,
+                album TEXT,
+                albumartist TEXT,
+                title TEXT,
+                duration INTEGER,
+                year INTEGER,
+                genre TEXT
+            )",
+            [],
+        ).expect("Failed to initialize database schema");
+        println!("Created database: {}", db_path);
     }
 
     let args = Cli::parse();
