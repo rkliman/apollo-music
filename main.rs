@@ -3,7 +3,7 @@ use lofty::file::TaggedFileExt;
 use lofty::prelude::ItemKey;
 use lofty::file::AudioFile;
 use clap::{Parser, Subcommand, ArgAction};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::fs;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -16,12 +16,15 @@ use std::time::Duration;
 use std::thread;
 use lofty::config::WriteOptions;
 use lofty::tag::TagExt; // needed for insert_text / save_to_path — remove if already in scope
+use toml;
 
 use deunicode::deunicode;
 
 fn normalize_text(s: &str) -> String {
     deunicode(s)
 }
+
+const CONFIG_PATH: &str = "~/.config/apollo-music/config.toml";
 
 // ---------------------------------------------------------------------
 // Helper functions to replace removed dependencies
@@ -190,7 +193,7 @@ impl Drop for TickingBar {
     }
 }
 
-/// Search for a pattern in a file and display the lines that contain it.
+/// A command line interface for managing your music library
 #[derive(Parser)]
 struct Cli {
     #[command(subcommand)]
@@ -280,7 +283,7 @@ enum Commands {
     },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct FilesConfig {
     music_directory: String,
     database_name: String,
@@ -288,10 +291,38 @@ struct FilesConfig {
     ignore: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Settings {
     files: FilesConfig,
     replace: Option<HashMap<String, String>>
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            files: FilesConfig {
+                music_directory: "~/Music".to_string(),
+                database_name: "~/Music/music_library.db".to_string(),
+                file_pattern: Some("{album}/{albumartist} - {title}.{ext}".to_string()),
+                ignore: Some(Vec::<String>::new())
+            },
+            replace: Some([
+                (":" , "∶"),
+                ("/" , "⁄"),
+                ("*" , "∗"),
+                ("?" , "？"),
+                ("\"" , "″"),
+                ("\\", "⧵"),
+                ("." , "․"),
+                ("|" , "ǀ"),
+                ("<" , "‹"),
+                (">" , "›"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect::<HashMap<String, String>>(),)
+        }
+    }
 }
 
 fn sanitize_filename_component(s: &str, replacements: &Option<HashMap<String, String>>) -> String {
@@ -616,9 +647,12 @@ fn find_duplicates(db_path: &str, fix: bool) {
 }
 
 fn load_settings() -> Settings {
-    let config_path = expand_tilde("~/.config/apollo-music/config.toml");
+    if !Path::new(&expand_tilde(CONFIG_PATH)).exists() {
+        let toml_string = toml::to_string_pretty(&Settings::default()).unwrap();
+        fs::write(expand_tilde(CONFIG_PATH), toml_string).unwrap();
+    }
     app_config::Config::builder()
-        .add_source(app_config::File::with_name(&config_path))
+        .add_source(app_config::File::with_name(&expand_tilde(CONFIG_PATH)))
         .add_source(app_config::Environment::with_prefix("APP"))
         .build()
         .unwrap()

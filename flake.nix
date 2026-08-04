@@ -19,7 +19,7 @@
             lockFile = ./Cargo.lock;
           };
           nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [ pkgs.sqlite ];
+          buildInputs = [ pkgs.sqlite pkgs.openssl ];
           meta = with pkgs.lib; {
             description = "Apollo music library CLI tool";
             license = licenses.mit;

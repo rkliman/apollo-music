@@ -20,6 +20,7 @@ reqwest = { version = "0.13.4", features = ["json", "query", "native-tls"] }
 native-tls = "0.2.18"
 tokio = { version = "1.53.1", features = ["rt-multi-thread"] }
 deunicode = "1.6.2"
+toml = "1.1.4"
 
 [[bin]]
 name = "apollo"
